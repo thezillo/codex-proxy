@@ -1,0 +1,46 @@
+# codex-proxy-mini configuration.
+# Every value here has a sensible default baked into the binary; this file just
+# makes them explicit and tunable. Env vars (CODEXPROXY_*) override these.
+
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[client_auth]
+# Keys that clients must present (Authorization: Bearer <key>) to use the proxy.
+# Generate your own; "sk-local-..." is just a placeholder.
+keys = ["sk-local-changeme"]
+# Set to false to disable client auth entirely (only safe on a trusted localhost).
+require = true
+
+[upstream]
+# Where the Codex credentials live. `codex login` writes auth.json here.
+codex_home = "~/.codex"
+base_url = "https://chatgpt.com/backend-api"
+responses_path = "/codex/responses"
+issuer = "https://auth.openai.com"
+client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+originator = "codex_cli_rs"
+# Refresh the access token this many seconds before its JWT `exp`.
+refresh_skew_secs = 300
+request_timeout_secs = 600
+connect_timeout_secs = 30
+
+# Defaults applied to /v1/chat/completions when the client omits a field.
+[defaults]
+model = "gpt-5-codex"
+reasoning_effort = "medium"     # low | medium | high
+reasoning_summary = "auto"
+instructions = "You are a helpful coding assistant."
+# Emit Codex reasoning to the client as `reasoning_content` deltas.
+include_reasoning = false
+
+# Map client model names onto upstream model ids.
+[defaults.model_aliases]
+"gpt-4o" = "gpt-5-codex"
+"gpt-4.1" = "gpt-5-codex"
+"gpt-5" = "gpt-5"
+
+[logging]
+# trace | debug | info | warn | error
+level = "info"

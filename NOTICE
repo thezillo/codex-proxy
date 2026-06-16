@@ -1,0 +1,12 @@
+codex-proxy-mini
+Copyright 2026
+
+This product includes software derived from OpenAI Codex
+(https://github.com/openai/codex), licensed under the Apache License, Version 2.0.
+
+Specifically, the JWT claim/expiry parsing in `src/auth/jwt.rs` and the OAuth
+token-refresh request/response shapes in `src/auth/manager.rs` are adapted from
+`codex-rs/login/src/token_data.rs` and `codex-rs/login/src/auth/manager.rs`.
+
+The OAuth `client_id` ("app_EMoamEEZ73f0CkXaXp7hrann") and endpoint paths are
+public constants from the same project.
