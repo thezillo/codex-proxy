@@ -44,6 +44,27 @@ pub fn auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
 
+/// Seed `auth.json` from the `CODEXPROXY_AUTH_JSON` env var when the file is
+/// absent — for cloud deploys where credentials arrive as a secret rather than
+/// via `codex login`. Written once; afterwards the on-disk file (with rotated
+/// tokens) wins, so token rotation survives restarts when `codex_home` is a
+/// persistent volume.
+pub fn seed_from_env_if_absent(codex_home: &Path) -> anyhow::Result<()> {
+    let path = auth_file(codex_home);
+    if path.exists() {
+        return Ok(());
+    }
+    match std::env::var("CODEXPROXY_AUTH_JSON") {
+        Ok(content) if !content.trim().is_empty() => {
+            std::fs::create_dir_all(codex_home)?;
+            write_secret(&path, content.as_bytes())?;
+            tracing::info!("seeded auth.json from CODEXPROXY_AUTH_JSON");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn load(codex_home: &Path) -> anyhow::Result<AuthDotJson> {
     let path = auth_file(codex_home);
     let text = std::fs::read_to_string(&path)

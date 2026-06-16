@@ -113,6 +113,36 @@ or `CODEXPROXY_PROXY`:
 proxy = "socks5://user:pass@host:1080"   # or http://… / https://…
 ```
 
+## Deploy (Fly.io)
+
+A `Dockerfile` and `fly.toml` are included. Credentials are seeded from a secret
+and then persisted (with rotated tokens) on a volume, so the single-use refresh
+token survives restarts.
+
+```sh
+fly auth login
+
+# Edit `app` in fly.toml to a globally-unique name, then:
+fly launch --no-deploy --copy-config --name <your-app>
+
+# Persistent volume for ~/.codex (region must match primary_region in fly.toml)
+fly volumes create codex_data --size 1 --region iad
+
+# Secrets: your client key, your Codex credentials, optional egress proxy
+fly secrets set CODEXPROXY_API_KEYS="$(openssl rand -hex 24)"
+fly secrets set CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)"
+fly secrets set CODEXPROXY_PROXY="socks5://user:pass@host:1080"   # optional
+
+fly deploy
+```
+
+Point a client at `https://<your-app>.fly.dev/v1` with
+`Authorization: Bearer <the CODEXPROXY_API_KEYS value>`.
+
+> The proxy uses your ChatGPT subscription tokens — keep the app **private**,
+> always set `CODEXPROXY_API_KEYS`, and consider `CODEXPROXY_PROXY` if Fly's
+> egress region is blocked by OpenAI.
+
 ## License
 
 Apache-2.0. Portions adapted from openai/codex — see [`NOTICE`](./NOTICE).

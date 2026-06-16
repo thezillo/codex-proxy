@@ -52,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
 
     let codex_home = config.codex_home_path();
     tracing::info!(codex_home = %codex_home.display(), "loading credentials");
+    // Cloud-deploy convenience: write auth.json from a secret if it's missing.
+    auth::store::seed_from_env_if_absent(&codex_home)
+        .context("seeding auth.json from CODEXPROXY_AUTH_JSON")?;
     let auth = AuthManager::load(&config.upstream, codex_home, http.clone())
         .context("loading Codex credentials (run `codex login` first)")?;
 
