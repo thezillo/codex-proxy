@@ -34,11 +34,21 @@ async fn main() -> anyhow::Result<()> {
     // generation mid-stream. `read_timeout` instead bounds *idle* time between
     // chunks, which is the failure we actually want to catch. The OAuth refresh
     // sets its own short per-request timeout (see auth::manager).
-    let http = reqwest::Client::builder()
+    let mut http_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(config.upstream.connect_timeout_secs))
-        .read_timeout(Duration::from_secs(config.upstream.request_timeout_secs))
-        .build()
-        .context("building HTTP client")?;
+        .read_timeout(Duration::from_secs(config.upstream.request_timeout_secs));
+
+    // Optional outbound proxy for all upstream traffic (e.g. to reach OpenAI
+    // from a blocked region/IP). Applies to both forwarding and token refresh.
+    if let Some(proxy_url) = &config.upstream.proxy {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .context("invalid upstream.proxy URL (expected http://, https://, or socks5://)")?;
+        http_builder = http_builder.proxy(proxy);
+        // Never log the URL itself — it may carry credentials.
+        tracing::info!("routing upstream traffic through configured proxy");
+    }
+
+    let http = http_builder.build().context("building HTTP client")?;
 
     let codex_home = config.codex_home_path();
     tracing::info!(codex_home = %codex_home.display(), "loading credentials");

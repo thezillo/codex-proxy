@@ -25,6 +25,10 @@ originator = "codex_cli_rs"
 refresh_skew_secs = 300
 request_timeout_secs = 600
 connect_timeout_secs = 30
+# Optional outbound proxy for all upstream traffic (forward + token refresh).
+# http://, https://, or socks5://, with optional user:pass@. Handy when OpenAI
+# blocks your deploy region/IP. Leave unset for a direct connection.
+# proxy = "socks5://user:pass@host:1080"
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]

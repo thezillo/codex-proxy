@@ -100,7 +100,18 @@ client model names (e.g. `gpt-4o`) onto upstream ids.
 
 Selected env overrides: `CODEXPROXY_CONFIG`, `CODEXPROXY_PORT`,
 `CODEXPROXY_API_KEYS` (comma-separated), `CODEXPROXY_CODEX_HOME`,
-`CODEXPROXY_LOG`.
+`CODEXPROXY_PROXY`, `CODEXPROXY_LOG`.
+
+### Outbound proxy
+
+To route all upstream traffic (request forwarding **and** token refresh) through
+a proxy — e.g. when OpenAI blocks your deploy region/IP — set `[upstream] proxy`
+or `CODEXPROXY_PROXY`:
+
+```toml
+[upstream]
+proxy = "socks5://user:pass@host:1080"   # or http://… / https://…
+```
 
 ## License
 

@@ -44,6 +44,11 @@ pub struct UpstreamConfig {
     pub refresh_skew_secs: i64,
     pub request_timeout_secs: u64,
     pub connect_timeout_secs: u64,
+    /// Optional outbound proxy for ALL upstream traffic (forward + token
+    /// refresh). Supports `http://`, `https://`, and `socks5://`, with optional
+    /// `user:pass@` credentials. Useful when OpenAI blocks the deploy region/IP.
+    /// Empty/absent = direct connection (system proxy env vars still honored).
+    pub proxy: Option<String>,
 }
 
 /// Coding-friendly request defaults, applied when the client omits a field.
@@ -102,6 +107,7 @@ impl Default for UpstreamConfig {
             refresh_skew_secs: 300,
             request_timeout_secs: 600,
             connect_timeout_secs: 30,
+            proxy: None,
         }
     }
 }
@@ -165,6 +171,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CODEXPROXY_CODEX_HOME") {
             self.upstream.codex_home = v;
+        }
+        if let Ok(v) = std::env::var("CODEXPROXY_PROXY") {
+            self.upstream.proxy = if v.trim().is_empty() { None } else { Some(v) };
         }
         if let Ok(v) = std::env::var("CODEXPROXY_LOG") {
             self.logging.level = v;

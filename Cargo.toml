@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 axum = { version = "0.7", features = ["json"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
 futures-util = "0.3"
 async-stream = "0.3"
 bytes = "1"
