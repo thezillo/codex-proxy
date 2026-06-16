@@ -1,4 +1,4 @@
-# codex-proxy-mini
+# codex-proxy
 
 A minimal reverse proxy that exposes the **Codex (ChatGPT subscription) Responses
 API** over a local OpenAI-compatible endpoint, guarded by client API keys.
@@ -11,7 +11,7 @@ itself as a legitimate Codex client.
 ## How it works
 
 ```
-client ──Bearer <your-key>──▶ codex-proxy-mini ──Bearer <chatgpt-token>──▶ chatgpt.com/backend-api/codex/responses
+client ──Bearer <your-key>──▶ codex-proxy ──Bearer <chatgpt-token>──▶ chatgpt.com/backend-api/codex/responses
                                      │
                                      └─ reads ~/.codex/auth.json, auto-refreshes the token before it expires
 ```
@@ -45,8 +45,8 @@ cargo run --release
 ```
 
 The proxy listens on `http://127.0.0.1:8787` by default. The binary is
-`codex-proxy-mini`; after `cargo build --release` it lives at
-`target/release/codex-proxy-mini`.
+`codex-proxy`; after `cargo build --release` it lives at
+`target/release/codex-proxy`.
 
 ### Try it
 

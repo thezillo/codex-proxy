@@ -196,7 +196,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-proxy-mini"
+name = "codex-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",

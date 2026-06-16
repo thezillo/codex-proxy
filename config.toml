@@ -1,4 +1,4 @@
-# codex-proxy-mini configuration.
+# codex-proxy configuration.
 # Every value here has a sensible default baked into the binary; this file just
 # makes them explicit and tunable. Env vars (CODEXPROXY_*) override these.
 
