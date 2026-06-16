@@ -24,6 +24,12 @@ client ──Bearer <your-key>──▶ codex-proxy-mini ──Bearer <chatgpt-t
    and streams the response back (translating to/from the OpenAI Chat
    Completions format).
 
+## Requirements
+
+- Rust 1.95+ (2021 edition)
+- The official [`codex`](https://github.com/openai/codex) CLI, signed in once
+  (it writes `~/.codex/auth.json`, which this proxy reads and refreshes)
+
 ## Quick start
 
 ```sh
@@ -33,11 +39,14 @@ codex login
 # 2. Set your own client key
 $EDITOR config.toml          # change client_auth.keys
 
-# 3. Run
+# 3. Build and run (config.toml is read from the working directory;
+#    override the path with CODEXPROXY_CONFIG=/path/to/config.toml)
 cargo run --release
 ```
 
-The proxy listens on `http://127.0.0.1:8787` by default.
+The proxy listens on `http://127.0.0.1:8787` by default. The binary is
+`codex-proxy-mini`; after `cargo build --release` it lives at
+`target/release/codex-proxy-mini`.
 
 ### Try it
 
@@ -65,6 +74,22 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 `/v1/chat/completions` translates the request to the Responses wire format and
 the SSE response back to chat chunks — supporting text, tool/function calls,
 usage, and (optionally) reasoning. Point any OpenAI-compatible client at it.
+
+Upstream errors (e.g. `401`, `429`, `400` from Codex) are relayed with their
+original status code and body, not flattened — so client retry/auth logic keeps
+working.
+
+## Tools
+
+Tool definitions are forwarded transparently:
+
+- `type: "function"` tools are reshaped into the flat Responses form the backend
+  expects; the model emits `tool_calls` your client executes as usual.
+- **Hosted tools** the Codex backend runs itself — `web_search`,
+  `image_generation`, and any future ones — are passed through **untouched**. To
+  enable web search, just send `{ "type": "web_search" }` in the request's
+  `tools` array; the backend performs the search and folds results into the
+  answer (no extra setup here).
 
 ## Configuration
 
