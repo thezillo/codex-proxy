@@ -1,5 +1,8 @@
 # --- build stage ---
-FROM rust:1.95-slim AS builder
+# Pin to bookworm so the binary links against the same glibc (2.36) as the
+# runtime image below. The default `rust:1.95-slim` tracks Debian trixie
+# (glibc >=2.39), which produces a binary that won't run on bookworm-slim.
+FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release

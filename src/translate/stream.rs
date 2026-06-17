@@ -45,7 +45,10 @@ fn chunk_id() -> String {
 struct StreamState {
     tool_index: HashMap<String, usize>,
     next_index: usize,
-    ids_with_deltas: HashSet<String>,
+    /// Tool-call indices that already streamed incremental argument deltas.
+    /// Keyed by canonical index (not raw event id) so a delta labelled with
+    /// `item_id` and a `done` labelled with `call_id` still reconcile.
+    indices_with_deltas: HashSet<usize>,
     has_tool_calls: bool,
     has_content: bool,
 }
@@ -123,7 +126,7 @@ fn translate_event(
                 return out;
             };
             if let Some(d) = evt.get("delta").and_then(Value::as_str) {
-                st.ids_with_deltas.insert(key);
+                st.indices_with_deltas.insert(idx);
                 out.push(base(
                     json!({ "tool_calls": [{ "index": idx, "function": { "arguments": d } }] }),
                     None,
@@ -133,11 +136,15 @@ fn translate_event(
 
         "response.function_call_arguments.done" => {
             let key = event_call_key(evt);
-            if !st.ids_with_deltas.contains(&key) {
-                let Some(idx) = st.tool_index.get(&key).copied() else {
-                    tracing::warn!(%key, "tool-call args done for unknown call id; dropping");
-                    return out;
-                };
+            // Resolve to the canonical index first; both id labels map here, so a
+            // delta tagged with one label and this `done` tagged with the other
+            // still reconcile. Without this, the full arguments would be re-emitted
+            // on top of the streamed deltas, corrupting the client-side JSON.
+            let Some(idx) = st.tool_index.get(&key).copied() else {
+                tracing::warn!(%key, "tool-call args done for unknown call id; dropping");
+                return out;
+            };
+            if !st.indices_with_deltas.contains(&idx) {
                 let args = evt.get("arguments").and_then(Value::as_str).unwrap_or("");
                 out.push(base(
                     json!({ "tool_calls": [{ "index": idx, "function": { "arguments": args } }] }),
@@ -522,6 +529,44 @@ mod tests {
             &mut s,
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn mixed_item_id_and_call_id_does_not_duplicate_tool_args() {
+        let mut s = st();
+        // Announce the call; tool_index records BOTH i0 and c0 -> index 0.
+        let _ = translate_event(
+            &json!({"type":"response.output_item.added","item":{"type":"function_call","id":"i0","call_id":"c0","name":"a"}}),
+            "id",
+            1,
+            "m",
+            false,
+            &mut s,
+        );
+        // Deltas arrive labelled with item_id.
+        let deltas = translate_event(
+            &json!({"type":"response.function_call_arguments.delta","item_id":"i0","delta":"{\"x\":1}"}),
+            "id",
+            1,
+            "m",
+            false,
+            &mut s,
+        );
+        assert_eq!(deltas.len(), 1);
+        // `done` arrives labelled with the OTHER id (call_id). It must not
+        // re-emit the full arguments on top of the streamed deltas.
+        let done = translate_event(
+            &json!({"type":"response.function_call_arguments.done","call_id":"c0","arguments":"{\"x\":1}"}),
+            "id",
+            1,
+            "m",
+            false,
+            &mut s,
+        );
+        assert!(
+            done.is_empty(),
+            "done with mismatched id label re-emitted args: {done:?}"
+        );
     }
 
     #[test]
