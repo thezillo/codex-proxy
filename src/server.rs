@@ -66,13 +66,12 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Minimal static models list so OpenAI-style clients can populate a picker.
+/// Static models list so OpenAI-style clients can populate a picker.
 async fn models() -> impl IntoResponse {
     Json(json!({
         "object": "list",
         "data": [
-            { "id": "gpt-5-codex", "object": "model", "owned_by": "openai" },
-            { "id": "gpt-5", "object": "model", "owned_by": "openai" },
+            { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
         ]
     }))
 }

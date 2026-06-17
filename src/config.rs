@@ -67,8 +67,8 @@ pub struct UpstreamConfig {
 pub struct DefaultsConfig {
     /// Upstream model used when the request's model isn't a known alias/id.
     pub model: String,
-    /// low | medium | high — injected as reasoning.effort when the client
-    /// doesn't send reasoning_effort.
+    /// low | medium | high | xhigh — injected as reasoning.effort when the
+    /// client doesn't send reasoning_effort.
     pub reasoning_effort: String,
     /// reasoning.summary value ("auto" | "concise" | "detailed" | "none").
     pub reasoning_summary: String,
@@ -140,7 +140,7 @@ impl Default for UpstreamConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-5-codex".to_string(),
+            model: "gpt-5.5".to_string(),
             reasoning_effort: "medium".to_string(),
             reasoning_summary: "auto".to_string(),
             instructions: "You are a helpful coding assistant.".to_string(),

@@ -42,8 +42,8 @@ connect_timeout_secs = 30
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]
-model = "gpt-5-codex"
-reasoning_effort = "medium"     # low | medium | high
+model = "gpt-5.5"
+reasoning_effort = "medium"     # low | medium | high | xhigh
 reasoning_summary = "auto"
 instructions = "You are a helpful coding assistant."
 # Emit Codex reasoning to the client as `reasoning_content` deltas.
