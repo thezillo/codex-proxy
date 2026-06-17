@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/models/:model", get(model_by_id))
         .route(
             "/v1/responses",
             post(responses).route_layer(auth_layer.clone()),
@@ -66,14 +67,46 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+/// Models this proxy advertises. The Codex upstream only serves gpt-5.5 over a
+/// ChatGPT account, so that's the single id exposed to clients. Both the list
+/// and retrieve endpoints derive their output from this slice.
+const SUPPORTED_MODELS: &[&str] = &["gpt-5.5"];
+
+/// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
+/// so a `GET /v1/models/{id}` retrieve and a list entry stay byte-identical.
+fn model_object(id: &str) -> serde_json::Value {
+    json!({ "id": id, "object": "model", "owned_by": "openai" })
+}
+
 /// Static models list so OpenAI-style clients can populate a picker.
 async fn models() -> impl IntoResponse {
-    Json(json!({
-        "object": "list",
-        "data": [
-            { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
-        ]
-    }))
+    let data: Vec<serde_json::Value> = SUPPORTED_MODELS.iter().map(|id| model_object(id)).collect();
+    Json(json!({ "object": "list", "data": data }))
+}
+
+/// OpenAI-compatible "retrieve model" (`GET /v1/models/{id}`). Codex clients
+/// (e.g. cyrus's `CodexRunner`) probe this to validate a configured model before
+/// a run; without it the 404 makes them fall back to an unsupported default
+/// (`gpt-5.2-codex`), which the ChatGPT-account upstream then rejects. Return
+/// the same object as the list endpoint for known ids, else a 404 with the
+/// canonical `model_not_found` error shape.
+async fn model_by_id(Path(model): Path<String>) -> Response {
+    if SUPPORTED_MODELS.contains(&model.as_str()) {
+        return Json(model_object(&model)).into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": format!("Model '{model}' not found"),
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Passthrough to the Codex Responses API. Streams the upstream response back
@@ -293,6 +326,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn models_list_and_retrieve_agree_for_known_model() {
+        let app = test_router(8);
+
+        let list = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let listed = &list["data"][0];
+        assert_eq!(listed["id"], "gpt-5.5");
+
+        let retrieved = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/models/gpt-5.5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retrieved.status(), StatusCode::OK);
+        let retrieved: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(retrieved.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // Retrieve must mirror the list entry, so model-validating clients accept it.
+        assert_eq!(&retrieved, listed);
+    }
+
+    #[tokio::test]
+    async fn retrieve_unknown_model_is_404() {
+        let app = test_router(8);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/models/gpt-5.2-codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "model_not_found");
     }
 
     #[tokio::test]
