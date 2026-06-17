@@ -60,14 +60,40 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Arc::new(Upstream::new(&config.upstream, http, auth));
 
-    if config.client_auth.require
-        && config
-            .client_auth
-            .keys
-            .iter()
-            .any(|k| k == "sk-local-changeme")
-    {
-        tracing::warn!("client_auth still uses the default key 'sk-local-changeme' — change it");
+    // Guard against shipping an open door. The runtime image carries no
+    // config.toml, so a cloud deploy that forgets CODEXPROXY_API_KEYS falls back
+    // to the built-in default key while binding 0.0.0.0 — anyone who knows the
+    // public placeholder could then spend the subscription. Refuse to start when
+    // exposed (non-loopback) without real auth; only warn on a loopback bind.
+    let uses_default_key = config
+        .client_auth
+        .keys
+        .iter()
+        .any(|k| k == config::DEFAULT_CLIENT_KEY);
+    if is_loopback_host(&config.server.host) {
+        if config.client_auth.require && uses_default_key {
+            tracing::warn!(
+                "client_auth still uses the default key 'sk-local-changeme' — change it"
+            );
+        }
+    } else if !config.client_auth.require {
+        anyhow::bail!(
+            "refusing to start: binding non-loopback host {} with client_auth.require=false — \
+             set CODEXPROXY_API_KEYS and keep auth enabled",
+            config.server.host
+        );
+    } else if uses_default_key {
+        anyhow::bail!(
+            "refusing to start: binding non-loopback host {} with the built-in default API key \
+             'sk-local-changeme' — set CODEXPROXY_API_KEYS to strong secret(s)",
+            config.server.host
+        );
+    } else if config.client_auth.keys.is_empty() {
+        anyhow::bail!(
+            "refusing to start: binding non-loopback host {} with an empty client key set — \
+             set CODEXPROXY_API_KEYS",
+            config.server.host
+        );
     }
 
     let state = AppState {
@@ -89,6 +115,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `host` binds only the local machine. Treats the IPv4/IPv6 loopback
+/// literals and `localhost` as loopback; everything else (notably `0.0.0.0`,
+/// `::`, or a public address) counts as exposed and triggers the auth guard.
+fn is_loopback_host(host: &str) -> bool {
+    match host.trim().parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // Not an IP literal: only the well-known hostname resolves to loopback.
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 fn init_logging(level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("codex_proxy={level},tower_http=warn")));
@@ -98,4 +135,28 @@ fn init_logging(level: &str) {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_host;
+
+    #[test]
+    fn loopback_hosts_are_recognized() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LocalHost"));
+        assert!(is_loopback_host(" 127.0.0.1 "));
+    }
+
+    #[test]
+    fn exposed_hosts_are_not_loopback() {
+        // The Fly bind address and any public/wildcard address must count as
+        // exposed so the default-key guard fires.
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("::"));
+        assert!(!is_loopback_host("10.0.0.5"));
+        assert!(!is_loopback_host("example.com"));
+    }
 }

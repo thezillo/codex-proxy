@@ -23,6 +23,10 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Max request body the proxy will buffer before forwarding, in bytes.
+    /// Overrides Axum's 2 MB default for the `Bytes` extractor, which would
+    /// otherwise 413 large contexts or base64 image payloads before proxying.
+    pub max_body_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,14 +85,24 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8787,
+            // 16 MiB: covers long conversations and a few base64 images while
+            // bounding how much a single request can buffer on a small (256 MB)
+            // VM — at hard_limit=60 connections even this is generous. Raise via
+            // CODEXPROXY_MAX_BODY_BYTES when the host has memory headroom.
+            max_body_bytes: 16 * 1024 * 1024,
         }
     }
 }
 
+/// Built-in placeholder client key used when no config/env supplies one. Known
+/// publicly, so it must never guard a non-loopback deployment — startup refuses
+/// to bind a public interface while this key is in the accepted set.
+pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
+
 impl Default for ClientAuthConfig {
     fn default() -> Self {
         Self {
-            keys: vec!["sk-local-changeme".to_string()],
+            keys: vec![DEFAULT_CLIENT_KEY.to_string()],
             require: true,
         }
     }
@@ -158,6 +172,15 @@ impl Config {
                 Err(_) => tracing::warn!(
                     "ignoring invalid CODEXPROXY_PORT={v:?}; using {}",
                     self.server.port
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("CODEXPROXY_MAX_BODY_BYTES") {
+            match v.parse() {
+                Ok(n) => self.server.max_body_bytes = n,
+                Err(_) => tracing::warn!(
+                    "ignoring invalid CODEXPROXY_MAX_BODY_BYTES={v:?}; using {}",
+                    self.server.max_body_bytes
                 ),
             }
         }

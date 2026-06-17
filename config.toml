@@ -5,6 +5,10 @@
 [server]
 host = "127.0.0.1"
 port = 8787
+# Max JSON body buffered per request before forwarding (16 MiB; the binary
+# default). Raise for very large contexts / base64 images; this is also the
+# memory a single request can pin, so keep it modest on tiny VMs.
+max_body_bytes = 16777216
 
 [client_auth]
 # Keys that clients must present (Authorization: Bearer <key>) to use the proxy.

@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,12 +29,37 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    // Lift Axum's 2 MB default body cap to the configured limit so large
+    // contexts / base64 images aren't 413'd before we can proxy them.
+    let body_limit = state.config.server.max_body_bytes;
+    let auth_layer = middleware::from_fn_with_state(state.config.clone(), require_client_auth);
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/responses",
+            post(responses).route_layer(auth_layer.clone()),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).route_layer(auth_layer),
+        )
+        .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
+}
+
+/// Authenticate before any handler body extractor runs. The POST endpoints
+/// accept potentially-large JSON bodies, so doing this inside the handler would
+/// let unauthenticated clients force buffering up to `max_body_bytes`.
+async fn require_client_auth(
+    State(config): State<Arc<Config>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, ProxyError> {
+    check_client_auth(&config, &headers)?;
+    Ok(next.run(request).await)
 }
 
 async fn health() -> impl IntoResponse {
@@ -55,11 +81,8 @@ async fn models() -> impl IntoResponse {
 /// to the client as-is (preserving SSE).
 async fn responses(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
-    check_client_auth(&state.config, &headers)?;
-
     let upstream = state.upstream.forward_responses(body).await?;
 
     let status =
@@ -88,11 +111,8 @@ async fn responses(
 /// forward, then translate the response back (streaming or buffered).
 async fn chat_completions(
     State(state): State<AppState>,
-    headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
-    check_client_auth(&state.config, &headers)?;
-
     let req: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ProxyError::BadRequest(format!("invalid chat request: {e}")))?;
     let client_wants_stream = req.stream.unwrap_or(false);
@@ -201,7 +221,26 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, key_matches};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request as HttpRequest, StatusCode};
+    use axum::response::Response;
+    use axum::routing::post;
+    use axum::Router;
+    use base64::Engine;
+    use bytes::Bytes;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    use super::{constant_time_eq, key_matches, router, AppState};
+    use crate::auth::AuthManager;
+    use crate::config::Config;
+    use crate::upstream::Upstream;
 
     #[test]
     fn constant_time_eq_matches_semantics() {
@@ -218,5 +257,289 @@ mod tests {
         assert!(key_matches(&keys, "k2"));
         assert!(!key_matches(&keys, "k3"));
         assert!(!key_matches(&[], "anything"));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_large_body_is_rejected_before_body_limit() {
+        let app = test_router(8);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::from(vec![b'a'; 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // This must be 401, not 413: auth should run before `Bytes` buffers and
+        // applies the configured request-body limit.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_large_body_still_hits_body_limit() {
+        let app = test_router(8);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("Authorization", "Bearer test-key")
+                    .body(Body::from(vec![b'a'; 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_forwards_to_upstream_and_collects_response() {
+        let upstream_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let fake = start_fake_upstream(StatusCode::OK, "text/event-stream", upstream_body).await;
+        let app = test_router_with_upstream(1024 * 1024, fake.base_url.clone());
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("Authorization", "Bearer test-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [
+                                { "role": "system", "content": "be concise" },
+                                { "role": "user", "content": "hi" }
+                            ],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+        assert_eq!(body["usage"]["total_tokens"], 5);
+
+        let captured = fake.recv().await;
+        assert!(captured
+            .authorization
+            .as_deref()
+            .is_some_and(|v| v.starts_with("Bearer ")));
+        assert_eq!(captured.account_id.as_deref(), Some("acct_test"));
+        assert_eq!(captured.originator.as_deref(), Some("codex_cli_rs"));
+        assert_eq!(captured.accept.as_deref(), Some("text/event-stream"));
+
+        let upstream_request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(upstream_request["model"], "gpt-5-codex");
+        assert_eq!(upstream_request["instructions"], "be concise");
+        assert_eq!(upstream_request["input"][0]["role"], "user");
+        assert_eq!(upstream_request["input"][0]["content"], "hi");
+        assert_eq!(upstream_request["stream"], true);
+        assert_eq!(upstream_request["store"], false);
+        assert_eq!(upstream_request["reasoning"]["effort"], "medium");
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_passthrough_preserves_status_content_type_and_body() {
+        let fake =
+            start_fake_upstream(StatusCode::ACCEPTED, "application/json", r#"{"ok":true}"#).await;
+        let app = test_router_with_upstream(1024 * 1024, fake.base_url.clone());
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("Authorization", "Bearer test-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"input":"raw"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"ok":true}"#);
+
+        let captured = fake.recv().await;
+        assert_eq!(captured.account_id.as_deref(), Some("acct_test"));
+        assert_eq!(captured.content_type.as_deref(), Some("application/json"));
+        assert_eq!(&captured.body[..], br#"{"input":"raw"}"#);
+    }
+
+    fn test_router(max_body_bytes: usize) -> axum::Router {
+        test_router_with_upstream(max_body_bytes, Config::default().upstream.base_url)
+    }
+
+    fn test_router_with_upstream(max_body_bytes: usize, upstream_base_url: String) -> axum::Router {
+        let mut config = Config::default();
+        config.client_auth.keys = vec!["test-key".to_string()];
+        config.server.max_body_bytes = max_body_bytes;
+        config.upstream.base_url = upstream_base_url;
+
+        let http = reqwest::Client::new();
+        let auth = AuthManager::load(&config.upstream, write_test_auth_json(), http.clone())
+            .expect("load test auth");
+        let upstream = Arc::new(Upstream::new(&config.upstream, http, auth));
+
+        router(AppState {
+            config: Arc::new(config),
+            upstream,
+        })
+    }
+
+    struct FakeUpstream {
+        base_url: String,
+        rx: mpsc::Receiver<CapturedUpstreamRequest>,
+    }
+
+    impl FakeUpstream {
+        async fn recv(mut self) -> CapturedUpstreamRequest {
+            self.rx.recv().await.expect("fake upstream request")
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeUpstreamState {
+        tx: mpsc::Sender<CapturedUpstreamRequest>,
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    }
+
+    struct CapturedUpstreamRequest {
+        authorization: Option<String>,
+        account_id: Option<String>,
+        originator: Option<String>,
+        accept: Option<String>,
+        content_type: Option<String>,
+        body: Bytes,
+    }
+
+    async fn start_fake_upstream(
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> FakeUpstream {
+        let (tx, rx) = mpsc::channel(1);
+        let state = FakeUpstreamState {
+            tx,
+            status,
+            content_type,
+            body,
+        };
+        let app = Router::new()
+            .route("/codex/responses", post(fake_responses))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        FakeUpstream {
+            base_url: format!("http://{addr}"),
+            rx,
+        }
+    }
+
+    async fn fake_responses(
+        axum::extract::State(state): axum::extract::State<FakeUpstreamState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let header = |name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let captured = CapturedUpstreamRequest {
+            authorization: header("authorization"),
+            account_id: header("chatgpt-account-id"),
+            originator: header("originator"),
+            accept: header("accept"),
+            content_type: header("content-type"),
+            body,
+        };
+        state.tx.send(captured).await.unwrap();
+
+        Response::builder()
+            .status(state.status)
+            .header("Content-Type", state.content_type)
+            .body(Body::from(state.body))
+            .unwrap()
+    }
+
+    fn write_test_auth_json() -> PathBuf {
+        let codex_home = unique_temp_dir();
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let access_token = unsigned_jwt(json!({ "exp": 4_102_444_800_i64 }));
+        let id_token = unsigned_jwt(json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_test"
+            }
+        }));
+        let auth_json = json!({
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": "refresh_test"
+            }
+        });
+        fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec(&auth_json).unwrap(),
+        )
+        .unwrap();
+
+        codex_home
+    }
+
+    fn unsigned_jwt(payload: serde_json::Value) -> String {
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header = engine.encode(br#"{"alg":"none"}"#);
+        let payload = engine.encode(serde_json::to_vec(&payload).unwrap());
+        format!("{header}.{payload}.signature")
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "codex-proxy-test-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }

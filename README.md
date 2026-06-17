@@ -94,13 +94,14 @@ Tool definitions are forwarded transparently:
 ## Configuration
 
 All settings live in [`config.toml`](./config.toml) with coding-friendly
-defaults. Highlights under `[defaults]`: `model`, `reasoning_effort`,
-`instructions`, `include_reasoning`, and `[defaults.model_aliases]` for mapping
-client model names (e.g. `gpt-4o`) onto upstream ids.
+defaults. Highlights: `[server] max_body_bytes` for large contexts/images,
+`[defaults] model`, `reasoning_effort`, `instructions`, `include_reasoning`,
+and `[defaults.model_aliases]` for mapping client model names (e.g. `gpt-4o`)
+onto upstream ids.
 
 Selected env overrides: `CODEXPROXY_CONFIG`, `CODEXPROXY_PORT`,
-`CODEXPROXY_API_KEYS` (comma-separated), `CODEXPROXY_CODEX_HOME`,
-`CODEXPROXY_PROXY`, `CODEXPROXY_LOG`.
+`CODEXPROXY_MAX_BODY_BYTES`, `CODEXPROXY_API_KEYS` (comma-separated),
+`CODEXPROXY_CODEX_HOME`, `CODEXPROXY_PROXY`, `CODEXPROXY_LOG`.
 
 ### Outbound proxy
 

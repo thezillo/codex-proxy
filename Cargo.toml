@@ -27,6 +27,9 @@ thiserror = "1"
 anyhow = "1"
 os_info = "3"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 opt-level = "z"
 lto = true
