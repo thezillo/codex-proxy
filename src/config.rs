@@ -45,6 +45,12 @@ pub struct UpstreamConfig {
     pub issuer: String,
     pub client_id: String,
     pub originator: String,
+    /// Codex CLI version we impersonate in the upstream User-Agent. Only the
+    /// version is configured here; the `(OsType os_version; arch)` part is
+    /// generated from `os_info` at runtime, and there is no `codex-proxy`
+    /// suffix — both so the UA can't fingerprint the proxy to ChatGPT. Bump
+    /// this (or set `CODEXPROXY_CLI_VERSION`) when the real Codex CLI bumps.
+    pub cli_version: String,
     pub refresh_skew_secs: i64,
     pub request_timeout_secs: u64,
     pub connect_timeout_secs: u64,
@@ -99,6 +105,10 @@ impl Default for ServerConfig {
 /// to bind a public interface while this key is in the accepted set.
 pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 
+/// Default Codex CLI version impersonated in the upstream User-Agent. Bump when
+/// the real Codex CLI bumps, or override via config/`CODEXPROXY_CLI_VERSION`.
+pub const DEFAULT_CLI_VERSION: &str = "0.140.0";
+
 impl Default for ClientAuthConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +128,7 @@ impl Default for UpstreamConfig {
             // Public OAuth client id used by the Codex CLI for token refresh.
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
             originator: "codex_cli_rs".to_string(),
+            cli_version: DEFAULT_CLI_VERSION.to_string(),
             refresh_skew_secs: 300,
             request_timeout_secs: 600,
             connect_timeout_secs: 30,
@@ -194,6 +205,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CODEXPROXY_CODEX_HOME") {
             self.upstream.codex_home = v;
+        }
+        if let Ok(v) = std::env::var("CODEXPROXY_CLI_VERSION") {
+            self.upstream.cli_version = v;
         }
         if let Ok(v) = std::env::var("CODEXPROXY_PROXY") {
             self.upstream.proxy = if v.trim().is_empty() { None } else { Some(v) };

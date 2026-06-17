@@ -25,6 +25,12 @@ responses_path = "/codex/responses"
 issuer = "https://auth.openai.com"
 client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
 originator = "codex_cli_rs"
+# Codex CLI version impersonated in the upstream User-Agent. The full UA is
+# `{originator}/{cli_version} ({os} {os_version}; {arch})` — the OS/arch part is
+# generated at runtime, and there is no `codex-proxy` suffix, so the UA can't
+# fingerprint the proxy. Bump to match the real Codex CLI, or override with
+# CODEXPROXY_CLI_VERSION.
+cli_version = "0.140.0"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600

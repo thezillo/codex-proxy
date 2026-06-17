@@ -45,6 +45,7 @@ Env vars (override `config.toml`):
 - `CODEXPROXY_PROXY` — outbound proxy, `socks5://` / `http://` / `https://`.
 - `CODEXPROXY_HOST`, `CODEXPROXY_PORT` — bind address (image defaults to `0.0.0.0:8787`).
 - `CODEXPROXY_MAX_BODY_BYTES` — max request body, bytes (default 16 MiB).
+- `CODEXPROXY_CLI_VERSION` — Codex CLI version impersonated in the upstream User-Agent (OS/arch auto-detected).
 
 Or in `config.toml`:
 

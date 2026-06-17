@@ -22,7 +22,7 @@ impl Upstream {
             cfg.base_url.trim_end_matches('/'),
             cfg.responses_path
         );
-        let user_agent = build_user_agent(&cfg.originator);
+        let user_agent = build_user_agent(&cfg.originator, &cfg.cli_version);
         tracing::info!(%responses_url, %user_agent, "upstream configured");
         Self {
             http,
@@ -61,14 +61,19 @@ impl Upstream {
     }
 }
 
-/// Build a User-Agent matching the official Codex CLI format:
-///   `{originator}/{version} ({OsType} {os_version}; {arch}) codex-proxy`
-fn build_user_agent(originator: &str) -> String {
+/// Build a User-Agent byte-for-byte identical to the official Codex CLI:
+///   `{originator}/{cli_version} ({OsType} {os_version}; {arch})`
+///
+/// No `codex-proxy` suffix (that would fingerprint the proxy to ChatGPT), and
+/// `cli_version` is the impersonated Codex CLI release from config — not this
+/// crate's own version. The OS/arch are read from `os_info` at runtime so the
+/// string always reflects the real host instead of a hardcoded guess.
+fn build_user_agent(originator: &str, cli_version: &str) -> String {
     let info = os_info::get();
     format!(
-        "{}/{} ({} {}; {}) codex-proxy",
+        "{}/{} ({} {}; {})",
         originator,
-        env!("CARGO_PKG_VERSION"),
+        cli_version,
         info.os_type(),
         info.version(),
         info.architecture().unwrap_or("unknown"),

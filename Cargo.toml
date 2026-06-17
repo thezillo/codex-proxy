@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Minimal reverse proxy exposing the Codex (ChatGPT subscription) Responses API over a local OpenAI-compatible endpoint, with client API-key auth."
