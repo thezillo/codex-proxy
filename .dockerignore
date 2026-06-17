@@ -2,6 +2,6 @@ target
 .git
 .gitignore
 .serena
+.github
 README.md
-fly.toml
 *.md

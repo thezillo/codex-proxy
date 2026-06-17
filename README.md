@@ -114,35 +114,40 @@ or `CODEXPROXY_PROXY`:
 proxy = "socks5://user:pass@host:1080"   # or http://… / https://…
 ```
 
-## Deploy (Fly.io)
+## Container image (GHCR)
 
-A `Dockerfile` and `fly.toml` are included. Credentials are seeded from a secret
-and then persisted (with rotated tokens) on a volume, so the single-use refresh
-token survives restarts.
+Every push to `main` (and every `v*` tag) builds the `Dockerfile` and publishes
+it to the GitHub Container Registry via the
+[`docker-publish`](.github/workflows/docker-publish.yml) workflow:
 
-```sh
-fly auth login
-
-# Edit `app` in fly.toml to a globally-unique name, then:
-fly launch --no-deploy --copy-config --name <your-app>
-
-# Persistent volume for ~/.codex (region must match primary_region in fly.toml)
-fly volumes create codex_data --size 1 --region iad
-
-# Secrets: your client key, your Codex credentials, optional egress proxy
-fly secrets set CODEXPROXY_API_KEYS="$(openssl rand -hex 24)"
-fly secrets set CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)"
-fly secrets set CODEXPROXY_PROXY="socks5://user:pass@host:1080"   # optional
-
-fly deploy
+```
+ghcr.io/thezillo/codex-proxy:latest       # default branch
+ghcr.io/thezillo/codex-proxy:v1.2.3        # git tag
+ghcr.io/thezillo/codex-proxy:sha-<commit>  # any commit
 ```
 
-Point a client at `https://<your-app>.fly.dev/v1` with
+Run it anywhere that takes an OCI image. Credentials arrive via env, and the
+single-use refresh token is rotated onto a persistent volume mounted at
+`CODEXPROXY_CODEX_HOME`, so it survives restarts:
+
+```sh
+docker run -d --name codex-proxy -p 8787:8787 \
+  -v codex_data:/data \
+  -e CODEXPROXY_CODEX_HOME=/data \
+  -e CODEXPROXY_API_KEYS="$(openssl rand -hex 24)" \
+  -e CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)" \
+  -e CODEXPROXY_PROXY="socks5://user:pass@host:1080" \
+  ghcr.io/thezillo/codex-proxy:latest
+```
+
+`CODEXPROXY_AUTH_JSON` seeds `auth.json` only on first boot (while the volume is
+empty); afterwards the rotated on-disk token wins. `CODEXPROXY_PROXY` is an
+optional egress proxy. Point a client at `http://<host>:8787/v1` with
 `Authorization: Bearer <the CODEXPROXY_API_KEYS value>`.
 
-> The proxy uses your ChatGPT subscription tokens — keep the app **private**,
-> always set `CODEXPROXY_API_KEYS`, and consider `CODEXPROXY_PROXY` if Fly's
-> egress region is blocked by OpenAI.
+> The proxy spends your ChatGPT subscription tokens — keep it **private** and
+> always set `CODEXPROXY_API_KEYS`. The binary refuses to bind a non-loopback
+> address while still using the built-in default key.
 
 ## License
 

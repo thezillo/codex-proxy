@@ -1,0 +1,62 @@
+name: docker-publish
+
+# Build the Dockerfile and push it to GHCR on every push to the default branch
+# and on version tags. PRs build-only (no push) to validate the image.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # thezillo/codex-proxy
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io under the repo owner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Skip the login on PRs from forks (no package write, and we don't push).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache base-image / apt layers between runs. The single-layer cargo
+          # build still recompiles on any source change; swap the Dockerfile to
+          # cargo-chef + a deps layer if CI build time becomes a problem.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

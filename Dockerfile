@@ -16,7 +16,8 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/codex-proxy /usr/local/bin/codex-proxy
 
 # Bind on all interfaces inside the container; credentials live on a mounted
-# volume at /data (set CODEXPROXY_CODEX_HOME=/data in fly.toml).
+# volume — point CODEXPROXY_CODEX_HOME at its mount path (e.g. -v codex_data:/data
+# with CODEXPROXY_CODEX_HOME=/data) so rotated tokens survive restarts.
 ENV CODEXPROXY_HOST=0.0.0.0 \
     CODEXPROXY_PORT=8787
 EXPOSE 8787
