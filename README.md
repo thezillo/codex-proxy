@@ -1,153 +1,151 @@
 # codex-proxy
 
-A minimal reverse proxy that exposes the **Codex (ChatGPT subscription) Responses
-API** over a local OpenAI-compatible endpoint, guarded by client API keys.
+Use your **Codex (ChatGPT subscription)** from any OpenAI-compatible client. A
+tiny Rust reverse proxy that turns the Codex Responses API into a standard
+`/v1/chat/completions` (and `/v1/responses`) endpoint, guarded by your own key.
 
-No TLS fingerprinting, no Electron, no database — a single Rust binary. It uses
-the same credentials and request format as the official
-[openai/codex](https://github.com/openai/codex) CLI (Apache-2.0), so it presents
-itself as a legitimate Codex client.
+- **Single container / static binary** — no Electron, no database.
+- **Streaming (SSE)**, tool-calls, and hosted tools (`web_search`, `image_generation`).
+- **Looks like a real Codex client**: same request format, and a TLS fingerprint
+  pinned to match the official Codex client (reqwest + rustls 0.23.36).
+- Optional outbound **SOCKS5/HTTP proxy** for egress.
 
-## How it works
+## Quick start (Docker)
 
-```
-client ──Bearer <your-key>──▶ codex-proxy ──Bearer <chatgpt-token>──▶ chatgpt.com/backend-api/codex/responses
-                                     │
-                                     └─ reads ~/.codex/auth.json, auto-refreshes the token before it expires
-```
-
-1. You authenticate to the proxy with a key from `config.toml`.
-2. The proxy reads your Codex credentials from `~/.codex/auth.json`
-   (produced by `codex login`), refreshing the access token automatically.
-3. It forwards the request to the Codex Responses API with the proper
-   `Authorization`, `ChatGPT-Account-ID`, `originator`, and `User-Agent` headers,
-   and streams the response back (translating to/from the OpenAI Chat
-   Completions format).
-
-## Requirements
-
-- Rust 1.95+ (2021 edition)
-- The official [`codex`](https://github.com/openai/codex) CLI, signed in once
-  (it writes `~/.codex/auth.json`, which this proxy reads and refreshes)
-
-## Quick start
+**Prerequisite —** sign in to the official
+[`codex`](https://github.com/openai/codex) CLI once. It writes
+`~/.codex/auth.json`, which this proxy reads and auto-refreshes.
 
 ```sh
-# 1. Authenticate the official codex CLI once (creates ~/.codex/auth.json)
-codex login
+codex login   # once, with the official CLI
 
-# 2. Set your own client key
-$EDITOR config.toml          # change client_auth.keys
-
-# 3. Build and run (config.toml is read from the working directory;
-#    override the path with CODEXPROXY_CONFIG=/path/to/config.toml)
-cargo run --release
-```
-
-The proxy listens on `http://127.0.0.1:8787` by default. The binary is
-`codex-proxy`; after `cargo build --release` it lives at
-`target/release/codex-proxy`.
-
-### Try it
-
-```sh
-# OpenAI-compatible chat/completions (works with most OpenAI clients)
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer sk-local-changeme" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "model": "gpt-5-codex",
-        "messages": [{ "role": "user", "content": "Write a haiku about borrow checking." }],
-        "stream": true
-      }'
-```
-
-## Endpoints
-
-| Method | Path                    | Purpose                                                     |
-|--------|-------------------------|-------------------------------------------------------------|
-| POST   | `/v1/chat/completions`  | OpenAI Chat Completions → Codex Responses (stream + buffered)|
-| POST   | `/v1/responses`         | Raw passthrough to the Codex Responses API (streamed)       |
-| GET    | `/v1/models`            | Static model list                                           |
-| GET    | `/health`               | Liveness check                                              |
-
-`/v1/chat/completions` translates the request to the Responses wire format and
-the SSE response back to chat chunks — supporting text, tool/function calls,
-usage, and (optionally) reasoning. Point any OpenAI-compatible client at it.
-
-Upstream errors (e.g. `401`, `429`, `400` from Codex) are relayed with their
-original status code and body, not flattened — so client retry/auth logic keeps
-working.
-
-## Tools
-
-Tool definitions are forwarded transparently:
-
-- `type: "function"` tools are reshaped into the flat Responses form the backend
-  expects; the model emits `tool_calls` your client executes as usual.
-- **Hosted tools** the Codex backend runs itself — `web_search`,
-  `image_generation`, and any future ones — are passed through **untouched**. To
-  enable web search, just send `{ "type": "web_search" }` in the request's
-  `tools` array; the backend performs the search and folds results into the
-  answer (no extra setup here).
-
-## Configuration
-
-All settings live in [`config.toml`](./config.toml) with coding-friendly
-defaults. Highlights: `[server] max_body_bytes` for large contexts/images,
-`[defaults] model`, `reasoning_effort`, `instructions`, `include_reasoning`,
-and `[defaults.model_aliases]` for mapping client model names (e.g. `gpt-4o`)
-onto upstream ids.
-
-Selected env overrides: `CODEXPROXY_CONFIG`, `CODEXPROXY_PORT`,
-`CODEXPROXY_MAX_BODY_BYTES`, `CODEXPROXY_API_KEYS` (comma-separated),
-`CODEXPROXY_CODEX_HOME`, `CODEXPROXY_PROXY`, `CODEXPROXY_LOG`.
-
-### Outbound proxy
-
-To route all upstream traffic (request forwarding **and** token refresh) through
-a proxy — e.g. when OpenAI blocks your deploy region/IP — set `[upstream] proxy`
-or `CODEXPROXY_PROXY`:
-
-```toml
-[upstream]
-proxy = "socks5://user:pass@host:1080"   # or http://… / https://…
-```
-
-## Container image (GHCR)
-
-Every push to `main` (and every `v*` tag) builds the `Dockerfile` and publishes
-it to the GitHub Container Registry via the
-[`docker-publish`](.github/workflows/docker-publish.yml) workflow:
-
-```
-ghcr.io/thezillo/codex-proxy:latest       # default branch
-ghcr.io/thezillo/codex-proxy:v1.2.3        # git tag
-ghcr.io/thezillo/codex-proxy:sha-<commit>  # any commit
-```
-
-Run it anywhere that takes an OCI image. Credentials arrive via env, and the
-single-use refresh token is rotated onto a persistent volume mounted at
-`CODEXPROXY_CODEX_HOME`, so it survives restarts:
-
-```sh
 docker run -d --name codex-proxy -p 8787:8787 \
   -v codex_data:/data \
   -e CODEXPROXY_CODEX_HOME=/data \
   -e CODEXPROXY_API_KEYS="$(openssl rand -hex 24)" \
   -e CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)" \
-  -e CODEXPROXY_PROXY="socks5://user:pass@host:1080" \
   ghcr.io/thezillo/codex-proxy:latest
 ```
 
-`CODEXPROXY_AUTH_JSON` seeds `auth.json` only on first boot (while the volume is
-empty); afterwards the rotated on-disk token wins. `CODEXPROXY_PROXY` is an
-optional egress proxy. Point a client at `http://<host>:8787/v1` with
-`Authorization: Bearer <the CODEXPROXY_API_KEYS value>`.
+That's it. Point any OpenAI client at `http://localhost:8787/v1` and use the
+`CODEXPROXY_API_KEYS` value as the Bearer token:
 
-> The proxy spends your ChatGPT subscription tokens — keep it **private** and
-> always set `CODEXPROXY_API_KEYS`. The binary refuses to bind a non-loopback
-> address while still using the built-in default key.
+```sh
+curl http://localhost:8787/v1/chat/completions \
+  -H "Authorization: Bearer <your CODEXPROXY_API_KEYS value>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5-codex","stream":true,
+       "messages":[{"role":"user","content":"Write a haiku about borrow checking."}]}'
+```
+
+Image tags: `:latest`, `:v0.1.0` (releases), `:sha-<commit>`. Published to
+GHCR on every push to `main` and every `v*` tag.
+
+**docker compose:**
+
+```yaml
+services:
+  codex-proxy:
+    image: ghcr.io/thezillo/codex-proxy:latest
+    ports: ["8787:8787"]
+    volumes: ["codex_data:/data"]
+    environment:
+      CODEXPROXY_CODEX_HOME: /data
+      CODEXPROXY_API_KEYS: "replace-with-a-strong-key"
+      CODEXPROXY_AUTH_JSON: ${CODEXPROXY_AUTH_JSON}   # contents of ~/.codex/auth.json
+    restart: unless-stopped
+volumes:
+  codex_data:
+```
+
+> **Keep it private** and always set `CODEXPROXY_API_KEYS` — the proxy spends
+> your ChatGPT subscription. It refuses to bind a public address with the
+> built-in default key.
+
+Good to know:
+- `CODEXPROXY_AUTH_JSON` **seeds** `auth.json` only on first boot (while the
+  `/data` volume is empty). Afterwards the rotated on-disk token wins, so the
+  single-use refresh token survives restarts — keep the volume.
+- Add `-e CODEXPROXY_PROXY="socks5://user:pass@host:1080"` to send all upstream
+  traffic through an egress proxy (e.g. if OpenAI blocks your region/IP).
+
+## How it works
+
+```
+client ──Bearer <your-key>──▶ codex-proxy ──Bearer <chatgpt-token>──▶ chatgpt.com/backend-api/codex/responses
+```
+
+Your client authenticates to the proxy with your key. The proxy swaps in the
+ChatGPT subscription token from `auth.json` (refreshing it before it expires),
+adds the headers the official client sends, and streams the response back —
+translating to/from the OpenAI Chat Completions format.
+
+## Endpoints
+
+| Method | Path                   | Purpose                                                      |
+|--------|------------------------|-------------------------------------------------------------|
+| POST   | `/v1/chat/completions` | OpenAI Chat Completions → Codex Responses (stream + buffered)|
+| POST   | `/v1/responses`        | Raw passthrough to the Codex Responses API (streamed)       |
+| GET    | `/v1/models`           | Static model list                                           |
+| GET    | `/health`              | Liveness check                                              |
+
+Upstream errors (`401`, `429`, `400` …) are relayed with their original status
+and body, so client retry/auth logic keeps working.
+
+## Configuration
+
+Docker is configured entirely by the env vars above. The full set (env overrides
+take precedence over `config.toml`):
+
+| Env var | Purpose |
+|---------|---------|
+| `CODEXPROXY_API_KEYS` | comma-separated client keys (**required** when exposed) |
+| `CODEXPROXY_AUTH_JSON` | seed `auth.json` on first boot |
+| `CODEXPROXY_CODEX_HOME` | dir holding `auth.json` (e.g. `/data`) |
+| `CODEXPROXY_PROXY` | outbound `socks5://` / `http://` / `https://` proxy |
+| `CODEXPROXY_HOST` / `CODEXPROXY_PORT` | bind address (default `0.0.0.0:8787` in the image) |
+| `CODEXPROXY_MAX_BODY_BYTES` | max request body, bytes (default 16 MiB) |
+| `CODEXPROXY_CONFIG` / `CODEXPROXY_LOG` | config path / log level |
+
+For source runs or fine-tuning, everything lives in
+[`config.toml`](./config.toml). Minimal example:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8787
+
+[client_auth]
+keys = ["replace-with-a-strong-key"]
+
+[defaults]
+model = "gpt-5-codex"   # default when the client doesn't pick a model
+```
+
+Other `[defaults]` knobs: `reasoning_effort`, `instructions`,
+`include_reasoning`, and `[defaults.model_aliases]` to map client model names
+(e.g. `gpt-4o`) onto upstream ids.
+
+## Tools
+
+Tool definitions pass through transparently:
+
+- `type: "function"` tools are reshaped into the flat Responses form; the model
+  emits `tool_calls` your client executes as usual.
+- **Hosted tools** the backend runs itself (`web_search`, `image_generation`, …)
+  go through untouched — send `{ "type": "web_search" }` in `tools` and the
+  backend does the search and folds results into the answer.
+
+## Run from source
+
+```sh
+codex login                 # writes ~/.codex/auth.json
+$EDITOR config.toml         # set client_auth.keys
+cargo run --release         # reads ./config.toml (override: CODEXPROXY_CONFIG)
+```
+
+Requires Rust 1.95+. The binary is `target/release/codex-proxy`; it listens on
+`http://127.0.0.1:8787` by default.
 
 ## License
 
