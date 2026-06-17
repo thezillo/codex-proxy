@@ -34,7 +34,14 @@ async fn main() -> anyhow::Result<()> {
     // generation mid-stream. `read_timeout` instead bounds *idle* time between
     // chunks, which is the failure we actually want to catch. The OAuth refresh
     // sets its own short per-request timeout (see auth::manager).
+    // `use_rustls_tls()` pins the TLS backend to rustls (matching the real Codex
+    // client); the connection-pool/keepalive settings mirror it too. The actual
+    // ClientHello fingerprint comes from the reqwest/rustls versions+features in
+    // Cargo.toml, not from anything configured here.
     let mut http_builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(config.upstream.connect_timeout_secs))
         .read_timeout(Duration::from_secs(config.upstream.request_timeout_secs));
 

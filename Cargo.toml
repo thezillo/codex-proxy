@@ -12,7 +12,16 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 axum = { version = "0.7", features = ["json"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+# TLS fingerprint parity with the real Codex Desktop client (per the icebear
+# codex-proxy reverse-engineering): reqwest 0.12.28 + rustls pinned to =0.23.36
+# (its ClientHello changed in 0.23.37), native roots, http2 (ALPN h2), and the
+# same content-encodings. `rustls` is pinned directly to force the resolved
+# version; the provider stays `ring` (what rustls-tls-native-roots selects).
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "http2", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
+# Pin only — no default features, so this does NOT pull rustls's default
+# aws-lc-rs provider (which needs cmake and would change the fingerprint). The
+# `ring` provider is selected by reqwest's rustls-tls-native-roots feature.
+rustls = { version = "=0.23.36", default-features = false }
 futures-util = "0.3"
 async-stream = "0.3"
 bytes = "1"
