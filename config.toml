@@ -16,6 +16,12 @@ max_body_bytes = 16777216
 keys = ["sk-local-changeme"]
 # Set to false to disable client auth entirely (only safe on a trusted localhost).
 require = true
+# Optional: name each key so access logs show *who* is spending tokens instead
+# of a fingerprint. Maps the raw key to a label. Keys not listed here log as
+# `key-XXXXXXXX` (a non-reversible fingerprint). Example:
+# [client_auth.key_names]
+# "sk-local-changeme" = "my-laptop"
+# "sk-team-bob"       = "bob"
 
 [upstream]
 # Where the Codex credentials live. `codex login` writes auth.json here.
@@ -58,3 +64,7 @@ include_reasoning = false
 [logging]
 # trace | debug | info | warn | error
 level = "info"
+# "text" (human-readable, default) or "json" (one structured object per line).
+# Use "json" on hosted deploys (e.g. Fly) to query/aggregate the `access` lines
+# — e.g. sum `total_tokens` grouped by `client`. Override with CODEXPROXY_LOG_FORMAT.
+format = "text"

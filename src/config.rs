@@ -34,6 +34,12 @@ pub struct ServerConfig {
 pub struct ClientAuthConfig {
     pub keys: Vec<String>,
     pub require: bool,
+    /// Optional friendly label per key, so access logs name *who* is spending
+    /// tokens instead of an opaque fingerprint. Maps the raw key to a name
+    /// (e.g. "sk-abc..." -> "alice-laptop"). Keys absent here fall back to a
+    /// non-reversible fingerprint (`key-XXXXXXXX`). The raw key already lives in
+    /// `keys`, so storing it here too leaks nothing new.
+    pub key_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +90,10 @@ pub struct DefaultsConfig {
 #[serde(default)]
 pub struct LoggingConfig {
     pub level: String,
+    /// "text" (human-readable, default) or "json" (one structured object per
+    /// line). Use "json" on hosted deploys (e.g. Fly) so access lines can be
+    /// queried/aggregated — e.g. summing `total_tokens` grouped by `client`.
+    pub format: String,
 }
 
 impl Default for ServerConfig {
@@ -114,6 +124,7 @@ impl Default for ClientAuthConfig {
         Self {
             keys: vec![DEFAULT_CLIENT_KEY.to_string()],
             require: true,
+            key_names: HashMap::new(),
         }
     }
 }
@@ -154,6 +165,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
+            format: "text".to_string(),
         }
     }
 }
@@ -214,6 +226,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CODEXPROXY_LOG") {
             self.logging.level = v;
+        }
+        if let Ok(v) = std::env::var("CODEXPROXY_LOG_FORMAT") {
+            self.logging.format = v;
         }
     }
 

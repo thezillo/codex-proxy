@@ -13,13 +13,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use futures_util::TryStreamExt;
+use axum::{Extension, Json, Router};
 use serde_json::json;
 
 use crate::config::Config;
 use crate::error::ProxyError;
-use crate::translate::{build_codex_request, collect_chat, stream_chat, ChatCompletionRequest};
+use crate::observe::{self, AccessCtx, CompletionLog};
+use crate::translate::{
+    build_codex_request, collect_chat, stream_chat, tee_responses, ChatCompletionRequest,
+};
 use crate::upstream::Upstream;
 
 #[derive(Clone)]
@@ -56,10 +58,28 @@ pub fn router(state: AppState) -> Router {
 async fn require_client_auth(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ProxyError> {
-    check_client_auth(&config, &headers)?;
+    let client = check_client_auth(&config, &headers)?;
+    let ip = observe::client_ip(&headers);
+
+    // Start line: answers "who is calling, from where" for *every* protected
+    // endpoint — including the `/v1/responses` passthrough and requests the
+    // client aborts before any completion line can be emitted.
+    tracing::info!(
+        target: "access",
+        client = %client,
+        ip = %ip,
+        ua = %observe::user_agent(&headers),
+        method = %request.method(),
+        path = %request.uri().path(),
+        "request accepted"
+    );
+
+    // Hand the attribution to the handler so its completion line (model, tokens,
+    // status, duration) carries the same client/ip.
+    request.extensions_mut().insert(AccessCtx { client, ip });
     Ok(next.run(request).await)
 }
 
@@ -113,6 +133,7 @@ async fn model_by_id(Path(model): Path<String>) -> Response {
 /// to the client as-is (preserving SSE).
 async fn responses(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
     let upstream = state.upstream.forward_responses(body).await?;
@@ -128,7 +149,11 @@ async fn responses(
         .unwrap_or("application/json")
         .to_string();
 
-    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
+    // Forward verbatim, but tee the SSE for token usage so this passthrough —
+    // the path the real Codex CLI uses — is attributed too. Model isn't parsed
+    // here (the body may be many MB); `-` marks "raw passthrough".
+    let log = CompletionLog::new(ctx, "/v1/responses", "-");
+    let stream = tee_responses(upstream, log);
 
     Ok(Response::builder()
         .status(status)
@@ -143,6 +168,7 @@ async fn responses(
 /// forward, then translate the response back (streaming or buffered).
 async fn chat_completions(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
     let req: ChatCompletionRequest = serde_json::from_slice(&body)
@@ -150,6 +176,7 @@ async fn chat_completions(
     let client_wants_stream = req.stream.unwrap_or(false);
     let echo_model = req.model.clone();
     let defaults = state.config.defaults.clone();
+    let log = CompletionLog::new(ctx, "/v1/chat/completions", echo_model.clone());
 
     let codex_body = build_codex_request(&req, &defaults);
     let bytes = serde_json::to_vec(&codex_body)
@@ -161,11 +188,14 @@ async fn chat_completions(
     // content-type — so a 401/429/400 from Codex reaches the client unchanged
     // instead of being flattened to a generic 502.
     if !upstream.status().is_success() {
+        log.emit(upstream.status().as_u16(), None);
         return Ok(passthrough_response(upstream).await);
     }
 
     if client_wants_stream {
-        let stream = stream_chat(upstream, echo_model, defaults);
+        // The stream owns `log` and emits the completion line (with usage) when
+        // it finishes draining.
+        let stream = stream_chat(upstream, echo_model, defaults, log);
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/event-stream")
@@ -177,8 +207,19 @@ async fn chat_completions(
             }))
     } else {
         let json = collect_chat(upstream, echo_model, defaults).await?;
+        log.emit(StatusCode::OK.as_u16(), usage_pair(&json));
         Ok(Json(json).into_response())
     }
+}
+
+/// Pull `(prompt_tokens, completion_tokens)` from a buffered chat.completion
+/// body for the access log, or `None` if the usage block is missing.
+fn usage_pair(chat: &serde_json::Value) -> Option<(i64, i64)> {
+    let usage = chat.get("usage")?;
+    Some((
+        usage.get("prompt_tokens").and_then(|v| v.as_i64())?,
+        usage.get("completion_tokens").and_then(|v| v.as_i64())?,
+    ))
 }
 
 /// Relay an upstream `reqwest::Response` to the client verbatim: same status
@@ -205,10 +246,12 @@ async fn passthrough_response(upstream: reqwest::Response) -> Response {
 }
 
 /// Validate the client's `Authorization: Bearer <key>` against the configured
-/// key list. No-op when `client_auth.require = false`.
-fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<(), ProxyError> {
+/// key list and return a non-secret label for the matched key (configured name
+/// or fingerprint), used to attribute token spend in the access log. When
+/// `client_auth.require = false`, auth is skipped and everyone is `anonymous`.
+fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<String, ProxyError> {
     if !config.client_auth.require {
-        return Ok(());
+        return Ok("anonymous".to_string());
     }
 
     let presented = headers
@@ -218,7 +261,11 @@ fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<(), ProxyEr
         .map(str::trim);
 
     match presented {
-        Some(key) if key_matches(&config.client_auth.keys, key) => Ok(()),
+        // The matched key equals the presented one, so labelling by `key` looks
+        // up the right `key_names` entry (or derives a fingerprint).
+        Some(key) if key_matches(&config.client_auth.keys, key) => {
+            Ok(observe::key_label(key, &config.client_auth.key_names))
+        }
         Some(_) => Err(ProxyError::Unauthorized("invalid API key".into())),
         None => Err(ProxyError::Unauthorized(
             "missing Authorization: Bearer <key> header".into(),
@@ -456,6 +503,55 @@ mod tests {
         assert_eq!(upstream_request["stream"], true);
         assert_eq!(upstream_request["store"], false);
         assert_eq!(upstream_request["reasoning"]["effort"], "medium");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_streaming_passes_through_and_finishes() {
+        // Exercises the streaming path that carries the CompletionLog into
+        // stream_chat: the SSE must reach the client with content + [DONE].
+        let upstream_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let fake = start_fake_upstream(StatusCode::OK, "text/event-stream", upstream_body).await;
+        let app = test_router_with_upstream(1024 * 1024, fake.base_url.clone());
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("Authorization", "Bearer test-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [{ "role": "user", "content": "hi" }],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains("\"content\":\"Hi\""));
+        assert!(body.contains("data: [DONE]"));
     }
 
     #[tokio::test]

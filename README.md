@@ -46,6 +46,7 @@ Env vars (override `config.toml`):
 - `CODEXPROXY_HOST`, `CODEXPROXY_PORT` — bind address (image defaults to `0.0.0.0:8787`).
 - `CODEXPROXY_MAX_BODY_BYTES` — max request body, bytes (default 16 MiB).
 - `CODEXPROXY_CLI_VERSION` — Codex CLI version impersonated in the upstream User-Agent (OS/arch auto-detected).
+- `CODEXPROXY_LOG`, `CODEXPROXY_LOG_FORMAT` — log level and `text`/`json` output (see Logging).
 
 Or in `config.toml`:
 
@@ -66,6 +67,31 @@ model = "gpt-5-codex"
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their
 original status and body.
+
+## Logging & token usage
+
+Every authenticated request emits two lines under the `access` log target, so
+you can see **who** is spending tokens — useful when a shared subscription is
+being drained by an unknown caller:
+
+```
+request accepted   client=alice ip=1.2.3.4 ua=... method=POST path=/v1/chat/completions
+request completed  client=alice endpoint=/v1/chat/completions model=gpt-5.5 \
+                   status=200 prompt_tokens=18 completion_tokens=5 total_tokens=23 duration_ms=1392
+```
+
+- `client` is the friendly name from `[client_auth.key_names]`, or a
+  non-reversible fingerprint (`key-XXXXXXXX`) for unnamed keys — the raw key is
+  never logged.
+- `ip` is taken from `Fly-Client-IP` / `X-Forwarded-For` (the real caller behind
+  a proxy/edge).
+- Token counts cover **both** `/v1/chat/completions` and the `/v1/responses`
+  passthrough (the path the real Codex CLI uses).
+- Request/response bodies (your prompts) are **never** logged — only metadata.
+
+Set `CODEXPROXY_LOG_FORMAT=json` (or `[logging] format = "json"`) for one
+structured object per line, then aggregate — e.g. sum `total_tokens` grouped by
+`client`. The `access` target stays at `info` even if you lower the app level.
 
 ## Run from source
 

@@ -5,6 +5,7 @@
 mod auth;
 mod config;
 mod error;
+mod observe;
 mod server;
 mod translate;
 mod upstream;
@@ -25,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let config_path = std::env::var("CODEXPROXY_CONFIG").unwrap_or_else(|_| "config.toml".into());
     let config = Config::load(&config_path)?;
 
-    init_logging(&config.logging.level);
+    init_logging(&config.logging.level, &config.logging.format);
 
     // One shared HTTP client for both refresh and forwarding.
     //
@@ -133,10 +134,19 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
-fn init_logging(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("codex_proxy={level},tower_http=warn")));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+fn init_logging(level: &str, format: &str) {
+    // Keep the `access` target at info even if the operator lowers the app
+    // level, so token-attribution lines are never silently dropped. RUST_LOG
+    // still wins when set.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("codex_proxy={level},access=info,tower_http=warn"))
+    });
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if format.eq_ignore_ascii_case("json") {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }
 
 async fn shutdown_signal() {

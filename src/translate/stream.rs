@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::config::DefaultsConfig;
 use crate::error::ProxyError;
+use crate::observe::CompletionLog;
 
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -209,19 +210,22 @@ fn push_tool_call(tool_calls: &mut Vec<Value>, call_id: &str, name: &str, args: 
     }));
 }
 
+/// Pull `(input_tokens, output_tokens)` out of a `response.completed` event,
+/// or `None` when the upstream omitted the usage block. Shared by the wire
+/// translation (`usage_from_completed`) and the access-log token attribution so
+/// both read the same numbers.
+pub fn usage_tokens(evt: &Value) -> Option<(i64, i64)> {
+    let u = evt.pointer("/response/usage")?;
+    let input = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let output = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+    Some((input, output))
+}
+
 fn usage_from_completed(evt: &Value) -> Value {
-    let u = evt.pointer("/response/usage");
-    if u.is_none() {
+    let (input, output) = usage_tokens(evt).unwrap_or_else(|| {
         tracing::warn!("response.completed without usage block; reporting zero tokens");
-    }
-    let input = u
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output = u
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+        (0, 0)
+    });
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,
@@ -230,16 +234,23 @@ fn usage_from_completed(evt: &Value) -> Value {
 }
 
 /// Re-stream an upstream Responses SSE body as chat.completion.chunk SSE.
+///
+/// `log` is consumed when the stream finishes: token usage seen in the
+/// `response.completed` event is emitted on the access line. If the client
+/// disconnects mid-stream the future is dropped and no completion line fires —
+/// the middleware's start line already recorded *who* made the request.
 pub fn stream_chat(
     resp: reqwest::Response,
     model: String,
     defaults: DefaultsConfig,
+    log: CompletionLog,
 ) -> impl Stream<Item = Result<Bytes, ProxyError>> {
     let id = chunk_id();
     let created = now_secs();
     let include_reasoning = defaults.include_reasoning;
 
     try_stream! {
+        let mut final_usage: Option<(i64, i64)> = None;
         // Opening role chunk.
         yield sse(json!({
             "id": id,
@@ -273,11 +284,17 @@ pub fn stream_chat(
                         continue;
                     }
                 };
+                if evt.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    final_usage = usage_tokens(&evt);
+                }
                 for c in translate_event(&evt, &id, created, &model, include_reasoning, &mut st) {
                     yield sse(c);
                 }
             }
         }
+
+        // Stream drained cleanly: attribute the tokens this request spent.
+        log.emit(200, final_usage);
 
         // If upstream produced nothing, surface a visible note so the client
         // doesn't hang on an empty assistant message. Headers are already sent,
@@ -444,6 +461,63 @@ pub async fn collect_chat(
     }))
 }
 
+/// Forward an upstream Responses SSE body **verbatim** while tee-ing it for
+/// token usage. Used by the `/v1/responses` passthrough — the path the real
+/// Codex CLI hits — so its token spend is attributed too, without altering the
+/// bytes the client receives. The scan buffer only ever holds the current
+/// partial event (completed events are drained), so it adds negligible memory.
+pub fn tee_responses(
+    resp: reqwest::Response,
+    log: CompletionLog,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    let status = resp.status().as_u16();
+    try_stream! {
+        let mut scanner = SseUsageScanner::default();
+        let mut body = resp.bytes_stream();
+
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            // Scan a copy for usage; the forwarded `chunk` is never modified.
+            scanner.push(&chunk);
+            yield chunk;
+        }
+
+        log.emit(status, scanner.usage);
+    }
+}
+
+/// Incremental SSE scanner that watches a byte stream for the
+/// `response.completed` event and remembers its token usage — without altering
+/// the bytes. Chunk boundaries are arbitrary (an event may be split across
+/// reads), so it buffers across pushes and drains whole events as they
+/// complete; `buf` only ever holds the current partial event.
+#[derive(Default)]
+struct SseUsageScanner {
+    buf: Vec<u8>,
+    usage: Option<(i64, i64)>,
+}
+
+impl SseUsageScanner {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        while let Some((pos, dlen)) = find_event_delimiter(&self.buf) {
+            let block: Vec<u8> = self.buf.drain(..pos + dlen).collect();
+            let block = String::from_utf8_lossy(&block);
+            let Some(data) = extract_data(&block) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                continue;
+            }
+            if let Ok(evt) = serde_json::from_str::<Value>(&data) {
+                if evt.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    self.usage = usage_tokens(&evt);
+                }
+            }
+        }
+    }
+}
+
 /// First SSE event delimiter in `buf`, returning `(offset, delimiter_len)`.
 /// Handles both `\n\n` (LF) and `\r\n\r\n` (CRLF) line endings.
 fn find_event_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
@@ -486,6 +560,30 @@ mod tests {
 
     fn st() -> StreamState {
         StreamState::default()
+    }
+
+    #[test]
+    fn scanner_captures_usage_across_chunk_boundary() {
+        // The `response.completed` event is split mid-JSON across two pushes —
+        // the scanner must buffer and still recover the token counts.
+        let full = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let split = full.len() / 2;
+        let mut s = SseUsageScanner::default();
+        s.push(&full.as_bytes()[..split]);
+        assert_eq!(s.usage, None, "usage should not resolve from a partial event");
+        s.push(&full.as_bytes()[split..]);
+        assert_eq!(s.usage, Some((7, 3)));
+    }
+
+    #[test]
+    fn scanner_reports_none_without_usage_block() {
+        let mut s = SseUsageScanner::default();
+        s.push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
+        assert_eq!(s.usage, None);
     }
 
     #[test]
