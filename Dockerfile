@@ -1,18 +1,21 @@
 # --- build stage ---
-# Pin to bookworm so the binary links against the same glibc (2.36) as the
-# runtime image below. The default `rust:1.95-slim` tracks Debian trixie
-# (glibc >=2.39), which produces a binary that won't run on bookworm-slim.
-FROM rust:1.95-slim-bookworm AS builder
+# musl instead of glibc: a statically-linked binary sidesteps the
+# builder/runtime glibc-version matching that bit us before (bookworm vs
+# trixie -> "GLIBC_2.39 not found"), and musl's single-arena allocator keeps
+# RSS flatter under concurrent load than glibc's per-thread arenas. Safe here
+# because the dependency tree is pure-Rust: crypto provider is `ring` (no
+# aws-lc-rs/cmake), no openssl-sys or other C deps, DNS goes through musl's
+# own getaddrinfo (no hickory-dns).
+FROM rust:1.95-alpine AS builder
+RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY . .
 RUN cargo build --release
 
 # --- runtime stage ---
-FROM debian:bookworm-slim
+FROM alpine:3.20
 # rustls bundles its own roots, but keep ca-certificates for any system TLS path.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/release/codex-proxy /usr/local/bin/codex-proxy
 
 # Bind on all interfaces inside the container; credentials live on a mounted
