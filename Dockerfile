@@ -16,9 +16,13 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/codex-proxy /usr/local/bin/codex-proxy
 
 # Bind on all interfaces inside the container; credentials live on a mounted
-# volume — point CODEXPROXY_CODEX_HOME at its mount path (e.g. -v codex_data:/data
-# with CODEXPROXY_CODEX_HOME=/data) so rotated tokens survive restarts.
+# volume — point CODEXPROXY_DATA_DIR at its mount path (e.g. -v codex_data:/data
+# with CODEXPROXY_DATA_DIR=/data) so rotated tokens survive restarts.
 ENV CODEXPROXY_HOST=0.0.0.0 \
     CODEXPROXY_PORT=8787
-EXPOSE 8787
+# /metrics stays on its own port, loopback-only by default (see
+# CODEXPROXY_METRICS_HOST/PORT) — deliberately NOT set to 0.0.0.0 here, so a
+# deploy that just copies this image doesn't silently expose metrics
+# alongside the public API without an explicit choice to do so.
+EXPOSE 8787 9090
 ENTRYPOINT ["codex-proxy"]

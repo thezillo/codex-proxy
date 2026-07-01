@@ -1,3 +1,6 @@
 /target
 *.tmp
 .env
+*.key
+config.local.toml
+.serena/

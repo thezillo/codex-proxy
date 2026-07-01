@@ -7,25 +7,61 @@ host = "127.0.0.1"
 port = 8787
 # Max JSON body buffered per request before forwarding (16 MiB; the binary
 # default). Raise for very large contexts / base64 images; this is also the
-# memory a single request can pin, so keep it modest on tiny VMs.
+# memory a single request can pin, so keep it modest on tiny VMs. Also caps
+# the per-SSE-event parse buffer when reading the upstream/fallback response
+# back (a misbehaving provider that never sends an event boundary aborts the
+# request instead of buffering without limit — see src/translate/stream.rs).
 max_body_bytes = 16777216
+# /metrics (Prometheus scrape) runs on its OWN port — not multiplexed onto
+# the client-facing API above — so it can be firewalled/kept internal-only
+# independent of whether `host`/`port` are publicly exposed. Bound to
+# 127.0.0.1 by default regardless of `host`. Set metrics_port = 0 to disable
+# the metrics server entirely (metrics are still recorded in memory, just
+# never served).
+metrics_port = 9090
+metrics_host = "127.0.0.1"
 
 [client_auth]
-# Keys that clients must present (Authorization: Bearer <key>) to use the proxy.
-# Generate your own; "sk-local-..." is just a placeholder.
-keys = ["sk-local-changeme"]
 # Set to false to disable client auth entirely (only safe on a trusted localhost).
 require = true
-# Optional: name each key so access logs show *who* is spending tokens instead
-# of a fingerprint. Maps the raw key to a label. Keys not listed here log as
-# `key-XXXXXXXX` (a non-reversible fingerprint). Example:
-# [client_auth.key_names]
-# "sk-local-changeme" = "my-laptop"
-# "sk-team-bob"       = "bob"
+
+# Keys that clients must present (Authorization: Bearer <key>) to use the
+# proxy. Each entry's `key` is either a raw secret (compared directly) or a
+# `sha256:<hex>` digest — so config.toml never has to hold the real secret.
+# Generate a digest with: printf '%s' 'the-real-key' | shasum -a 256
+# `name` is optional; without it, access logs show a non-reversible
+# fingerprint (`key-XXXXXXXX`) instead of a label.
+
+[[client_auth.keys]]
+key = "sk-local-changeme" # placeholder — generate your own before deploying
+
+# [[client_auth.keys]]
+# key = "sk-team-bob"
+# name = "bob"
+
+# [[client_auth.keys]]
+# key = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+# name = "alice-laptop"
 
 [upstream]
-# Where the Codex credentials live. `codex login` writes auth.json here.
-codex_home = "~/.codex"
+# Where Codex credentials live. `codex login` writes auth.json directly here
+# for a single-account deploy — nothing else to configure.
+#
+# For multiple ChatGPT accounts (round-robin load distribution, e.g. one
+# account's rate limit isn't enough): drop each additional account's auth.json
+# in its own subdirectory of data_dir (its own `codex login --codex-home
+# <subdir>`, or its own mounted volume) and restart — the pool is discovered
+# automatically, nothing to list here. A 401/403/429 fails over to the next
+# pool account (see README).
+data_dir = "~/.codex"
+
+# Optional: label accounts in access logs, keyed by directory basename
+# (data_dir's own basename for the top-level account, else the subdirectory
+# name). Unlisted accounts log under their basename.
+# [upstream.account_names]
+# ".codex" = "primary"
+# "alice"  = "backup-alice"
+
 base_url = "https://chatgpt.com/backend-api"
 responses_path = "/codex/responses"
 issuer = "https://auth.openai.com"
@@ -45,6 +81,9 @@ connect_timeout_secs = 30
 # http://, https://, or socks5://, with optional user:pass@. Handy when OpenAI
 # blocks your deploy region/IP. Leave unset for a direct connection.
 # proxy = "socks5://user:pass@host:1080"
+# How long (seconds) a pool account is skipped by round-robin after a
+# 401(post-retry)/403/429 — only matters with multiple accounts configured.
+account_cooldown_secs = 30
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]
@@ -68,3 +107,42 @@ level = "info"
 # Use "json" on hosted deploys (e.g. Fly) to query/aggregate the `access` lines
 # — e.g. sum `total_tokens` grouped by `client`. Override with CODEXPROXY_LOG_FORMAT.
 format = "text"
+
+# Secondary Responses-API-compatible providers, tried in order, only once the
+# whole ChatGPT account pool above has failed (401 after retry / 403 / 429, or
+# every account being transport-unreachable). Both Azure OpenAI and OpenRouter
+# speak the same Responses API wire format Codex itself does — no other proxy
+# behavior changes when one is configured. None configured by default.
+#
+# model_map keys must match the "model" field actually sent upstream: for
+# /v1/chat/completions that's after `defaults.model_aliases` resolution, for
+# /v1/responses it's whatever the client itself sent. A model missing from a
+# provider's model_map means that provider is skipped for that request (never
+# guessed) — if you configure model_aliases, key model_map by the *aliased*
+# name, not the client-facing one.
+
+# [[fallback]]
+# name = "azure"
+# Verified against a real Azure OpenAI resource: `responses_path` is a plain
+# suffix appended to `base_url` (see src/fallback.rs), so the mandatory
+# `api-version` query string just rides along as part of it — this is the
+# classic per-resource API surface (`/openai/responses?api-version=...`), not
+# the newer unbounded "v1" preview surface some Azure docs describe.
+# base_url = "https://YOUR-RESOURCE.openai.azure.com/openai"
+# responses_path = "/responses?api-version=2025-04-01-preview"
+# auth_style = "api-key"          # sends `api-key: <api_key>`
+# api_key = "set-via-env"          # this line must be present, but the value
+#                                   # is only a placeholder if you set
+#                                   # CODEXPROXY_FALLBACK_AZURE_API_KEY — the
+#                                   # proxy refuses to start if the value is
+#                                   # still empty/blank once both are applied
+# [fallback.model_map]
+# "gpt-5.5" = "your-deployment-name"   # Azure: this is your deployment name, not "gpt-4o"
+#
+# [[fallback]]
+# name = "openrouter"
+# base_url = "https://openrouter.ai/api/v1"
+# auth_style = "bearer"           # sends `Authorization: Bearer <api_key>`
+# api_key = "sk-or-..."           # or CODEXPROXY_FALLBACK_OPENROUTER_API_KEY
+# [fallback.model_map]
+# "gpt-5.5" = "openai/gpt-4.1"

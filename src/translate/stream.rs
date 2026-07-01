@@ -239,11 +239,18 @@ fn usage_from_completed(evt: &Value) -> Value {
 /// `response.completed` event is emitted on the access line. If the client
 /// disconnects mid-stream the future is dropped and no completion line fires —
 /// the middleware's start line already recorded *who* made the request.
+///
+/// `max_event_bytes` bounds the per-event parse buffer: unlike `tee_responses`
+/// (a passive side channel), this buffer holds the data actually being
+/// translated, so there's no safe way to "give up and keep going" if an
+/// upstream never sends an event boundary — the stream ends with an error
+/// instead of buffering without limit.
 pub fn stream_chat(
     resp: reqwest::Response,
     model: String,
     defaults: DefaultsConfig,
     log: CompletionLog,
+    max_event_bytes: usize,
 ) -> impl Stream<Item = Result<Bytes, ProxyError>> {
     let id = chunk_id();
     let created = now_secs();
@@ -267,6 +274,11 @@ pub fn stream_chat(
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| ProxyError::Upstream(format!("stream read: {e}")))?;
             buf.extend_from_slice(&chunk);
+            if buf.len() > max_event_bytes {
+                Err(ProxyError::Upstream(format!(
+                    "upstream SSE event exceeded {max_event_bytes} bytes without an event boundary"
+                )))?;
+            }
 
             while let Some((pos, dlen)) = find_event_delimiter(&buf) {
                 let block: Vec<u8> = buf.drain(..pos + dlen).collect();
@@ -315,10 +327,14 @@ pub fn stream_chat(
 }
 
 /// Collect an upstream Responses SSE body into one chat.completion object.
+/// `max_event_bytes` bounds the per-event parse buffer the same way
+/// `stream_chat` does — see its docs for why this errors out rather than
+/// buffering without limit.
 pub async fn collect_chat(
     resp: reqwest::Response,
     model: String,
     defaults: DefaultsConfig,
+    max_event_bytes: usize,
 ) -> Result<Value, ProxyError> {
     let id = chunk_id();
     let created = now_secs();
@@ -338,6 +354,11 @@ pub async fn collect_chat(
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| ProxyError::Upstream(format!("stream read: {e}")))?;
         buf.extend_from_slice(&chunk);
+        if buf.len() > max_event_bytes {
+            return Err(ProxyError::Upstream(format!(
+                "upstream SSE event exceeded {max_event_bytes} bytes without an event boundary"
+            )));
+        }
 
         while let Some((pos, dlen)) = find_event_delimiter(&buf) {
             let block: Vec<u8> = buf.drain(..pos + dlen).collect();
@@ -465,14 +486,20 @@ pub async fn collect_chat(
 /// token usage. Used by the `/v1/responses` passthrough — the path the real
 /// Codex CLI hits — so its token spend is attributed too, without altering the
 /// bytes the client receives. The scan buffer only ever holds the current
-/// partial event (completed events are drained), so it adds negligible memory.
+/// partial event (completed events are drained), so it normally adds
+/// negligible memory; `max_event_bytes` bounds the pathological case (an
+/// upstream — including a third-party fallback provider — that never sends an
+/// event boundary) without ever affecting what's forwarded to the client:
+/// tee-ing usage is a side channel, so it just gives up on attribution past
+/// the cap rather than aborting the passthrough.
 pub fn tee_responses(
     resp: reqwest::Response,
     log: CompletionLog,
+    max_event_bytes: usize,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     let status = resp.status().as_u16();
     try_stream! {
-        let mut scanner = SseUsageScanner::default();
+        let mut scanner = SseUsageScanner::new(max_event_bytes);
         let mut body = resp.bytes_stream();
 
         while let Some(chunk) = body.next().await {
@@ -490,16 +517,45 @@ pub fn tee_responses(
 /// `response.completed` event and remembers its token usage — without altering
 /// the bytes. Chunk boundaries are arbitrary (an event may be split across
 /// reads), so it buffers across pushes and drains whole events as they
-/// complete; `buf` only ever holds the current partial event.
-#[derive(Default)]
+/// complete; `buf` only ever holds the current partial event, capped at
+/// `max_buf_bytes` — past that, an event boundary was never found (a
+/// misbehaving upstream), so scanning gives up for the rest of the response
+/// rather than buffering without limit.
 struct SseUsageScanner {
     buf: Vec<u8>,
     usage: Option<(i64, i64)>,
+    max_buf_bytes: usize,
+    gave_up: bool,
 }
 
 impl SseUsageScanner {
+    fn new(max_buf_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            usage: None,
+            max_buf_bytes,
+            gave_up: false,
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) {
+        if self.gave_up {
+            return;
+        }
         self.buf.extend_from_slice(chunk);
+        if self.buf.len() > self.max_buf_bytes {
+            tracing::warn!(
+                buffered_bytes = self.buf.len(),
+                limit = self.max_buf_bytes,
+                "SSE usage scanner buffer exceeded limit without an event boundary; \
+                 giving up on token-usage attribution for this response (bytes are \
+                 still forwarded to the client unaffected)"
+            );
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+            self.gave_up = true;
+            return;
+        }
         while let Some((pos, dlen)) = find_event_delimiter(&self.buf) {
             let block: Vec<u8> = self.buf.drain(..pos + dlen).collect();
             let block = String::from_utf8_lossy(&block);
@@ -572,7 +628,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let split = full.len() / 2;
-        let mut s = SseUsageScanner::default();
+        let mut s = SseUsageScanner::new(1024 * 1024);
         s.push(&full.as_bytes()[..split]);
         assert_eq!(s.usage, None, "usage should not resolve from a partial event");
         s.push(&full.as_bytes()[split..]);
@@ -581,9 +637,29 @@ mod tests {
 
     #[test]
     fn scanner_reports_none_without_usage_block() {
-        let mut s = SseUsageScanner::default();
+        let mut s = SseUsageScanner::new(1024 * 1024);
         s.push(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
         assert_eq!(s.usage, None);
+    }
+
+    #[test]
+    fn scanner_gives_up_past_the_cap_instead_of_buffering_without_limit() {
+        // No event delimiter ever arrives — a misbehaving upstream (including
+        // a third-party fallback provider). The scanner must stop growing its
+        // buffer rather than accumulate it forever.
+        let mut s = SseUsageScanner::new(16);
+        s.push(b"data: this line is deliberately longer than the cap and has no \\n\\n");
+        assert!(s.gave_up);
+        assert!(
+            s.buf.is_empty(),
+            "buffer must be dropped once giving up, not retained"
+        );
+
+        // Further pushes (even ones that would otherwise complete an event)
+        // are no-ops post-give-up — not a crash, not a resumed scan.
+        s.push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n");
+        assert_eq!(s.usage, None);
+        assert!(s.buf.is_empty());
     }
 
     #[test]

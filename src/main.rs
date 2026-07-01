@@ -5,8 +5,12 @@
 mod auth;
 mod config;
 mod error;
+mod fallback;
+mod metrics;
 mod observe;
 mod server;
+#[cfg(test)]
+mod test_support;
 mod translate;
 mod upstream;
 
@@ -18,6 +22,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::AuthManager;
 use crate::config::Config;
+use crate::fallback::FallbackChain;
+use crate::metrics::Metrics;
 use crate::server::AppState;
 use crate::upstream::Upstream;
 
@@ -58,15 +64,34 @@ async fn main() -> anyhow::Result<()> {
 
     let http = http_builder.build().context("building HTTP client")?;
 
-    let codex_home = config.codex_home_path();
-    tracing::info!(codex_home = %codex_home.display(), "loading credentials");
     // Cloud-deploy convenience: write auth.json from a secret if it's missing.
-    auth::store::seed_from_env_if_absent(&codex_home)
+    // Only ever applies to `upstream.data_dir` itself — additional pool
+    // accounts (subdirectories) are expected to arrive already provisioned
+    // (their own mounted volume/secret), so seeding intentionally does not
+    // fan out to them. Must run BEFORE `account_pool()`: discovery excludes
+    // `data_dir` whenever a subdirectory account already exists and
+    // `data_dir` itself has no `auth.json` yet, so seeding after discovery
+    // (or seeding whatever `pool[0]` happened to be) can target the wrong
+    // directory entirely in that layout.
+    auth::store::seed_from_env_if_absent(&config.primary_data_dir())
         .context("seeding auth.json from CODEXPROXY_AUTH_JSON")?;
-    let auth = AuthManager::load(&config.upstream, codex_home, http.clone())
-        .context("loading Codex credentials (run `codex login` first)")?;
 
-    let upstream = Arc::new(Upstream::new(&config.upstream, http, auth));
+    let pool = config.account_pool();
+    let mut accounts = Vec::with_capacity(pool.len());
+    for (codex_home, label) in pool {
+        tracing::info!(codex_home = %codex_home.display(), account = %label, "loading credentials");
+        let auth =
+            AuthManager::load(&config.upstream, codex_home, http.clone()).with_context(|| {
+                format!("loading Codex credentials for account '{label}' (run `codex login` first)")
+            })?;
+        accounts.push((auth, label));
+    }
+
+    let upstream = Arc::new(Upstream::new(&config.upstream, http.clone(), accounts));
+    let fallback = Arc::new(
+        FallbackChain::new(http, &config.fallback).context("configuring fallback providers")?,
+    );
+    let metrics = Arc::new(Metrics::new().context("registering Prometheus metrics")?);
 
     // Guard against shipping an open door. The runtime image carries no
     // config.toml, so a cloud deploy that forgets CODEXPROXY_API_KEYS falls back
@@ -77,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
         .client_auth
         .keys
         .iter()
-        .any(|k| k == config::DEFAULT_CLIENT_KEY);
+        .any(|k| k.key == config::DEFAULT_CLIENT_KEY);
     if is_loopback_host(&config.server.host) {
         if config.client_auth.require && uses_default_key {
             tracing::warn!(
@@ -107,18 +132,69 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: Arc::new(config.clone()),
         upstream,
+        fallback,
+        metrics: metrics.clone(),
     };
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
-    tracing::info!("listening on http://{addr}");
+    let main_server = async {
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("binding {addr}"))?;
+        tracing::info!("listening on http://{addr}");
+        axum::serve(listener, server::router(state))
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("server error")
+    };
 
-    axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    // Metrics run on a SEPARATE port from the client-facing API (never
+    // multiplexed onto the same router) so it can be network-isolated (Fly
+    // private networking, k8s NetworkPolicy) independently of whether the
+    // main API is publicly exposed. `metrics_port = 0` skips it entirely —
+    // metrics are still recorded in memory, just never served.
+    //
+    // The metrics listener is bound *before* `try_join!` below, and a bind
+    // failure here is deliberately NOT propagated: `try_join!` cancels every
+    // other future the instant any one resolves to `Err`, so if this bind
+    // failure instead surfaced from inside a future passed to `try_join!`,
+    // a metrics-port collision (9090 is also Prometheus's own conventional
+    // port — a real collision, not a hypothetical one) would tear down the
+    // already-running main API too. An observability subsystem failing to
+    // start must never take the actual proxy down with it.
+    if config.server.metrics_port == 0 {
+        main_server.await?;
+    } else {
+        let metrics_addr = format!(
+            "{}:{}",
+            config.server.metrics_host, config.server.metrics_port
+        );
+        match tokio::net::TcpListener::bind(&metrics_addr).await {
+            Ok(listener) => {
+                tracing::info!("metrics listening on http://{metrics_addr}");
+                let metrics_server = async {
+                    axum::serve(listener, server::metrics_router(metrics))
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await
+                        .context("metrics server error")
+                };
+                // Two independent `ctrl_c()` waits (one per
+                // `with_graceful_shutdown` above) both resolve on the same
+                // signal — tokio supports awaiting it concurrently from
+                // multiple tasks.
+                tokio::try_join!(main_server, metrics_server)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to bind metrics server on {metrics_addr}; \
+                     continuing without a metrics endpoint (metrics are \
+                     still recorded in memory)"
+                );
+                main_server.await?;
+            }
+        }
+    }
 
     Ok(())
 }

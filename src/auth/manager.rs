@@ -108,8 +108,22 @@ impl AuthManager {
     /// expired or about to expire.
     pub async fn headers(&self) -> Result<AuthHeaders, ProxyError> {
         if self.needs_refresh().await {
-            self.refresh().await?;
+            self.refresh_if_needed().await?;
         }
+        self.current_headers().await
+    }
+
+    /// Force a refresh regardless of the cached expiry, then return the
+    /// refreshed headers. For when the upstream itself rejects the current
+    /// bearer with 401 despite our client-side check saying it should still
+    /// be valid (clock skew, early revocation, ...) — mirrors the real Codex
+    /// CLI's own refresh-and-retry-once behavior on 401.
+    pub async fn force_refresh_headers(&self) -> Result<AuthHeaders, ProxyError> {
+        self.force_refresh().await?;
+        self.current_headers().await
+    }
+
+    async fn current_headers(&self) -> Result<AuthHeaders, ProxyError> {
         let state = self.state.read().await;
         Ok(AuthHeaders {
             bearer: state.access_token.clone(),
@@ -131,14 +145,36 @@ impl AuthManager {
         }
     }
 
-    async fn refresh(&self) -> Result<(), ProxyError> {
-        // Single-flight: whoever grabs the lock refreshes; others re-check.
+    /// Refresh only if the cached expiry says it's actually needed —
+    /// single-flight: whoever grabs the lock refreshes, others re-check.
+    async fn refresh_if_needed(&self) -> Result<(), ProxyError> {
         let _guard = self.refresh_lock.lock().await;
         if !self.needs_refresh().await {
             // Someone else refreshed while we waited for the lock.
             return Ok(());
         }
+        self.perform_refresh().await
+    }
 
+    /// Refresh unconditionally, bypassing the cached-expiry check — for the
+    /// reactive 401 path, where the expiry check already said the token
+    /// looked fine. Still single-flight against concurrent callers, but keyed
+    /// on the access token itself rather than `needs_refresh()` (which would
+    /// trivially say "no" right after any refresh, including someone else's
+    /// concurrent one, defeating the "unconditional" part): if the token
+    /// already changed while we waited for the lock, someone else's refresh
+    /// landed first, so skip our own OAuth call and use theirs.
+    async fn force_refresh(&self) -> Result<(), ProxyError> {
+        let token_before = self.state.read().await.access_token.clone();
+        let _guard = self.refresh_lock.lock().await;
+        if self.state.read().await.access_token != token_before {
+            return Ok(());
+        }
+        self.perform_refresh().await
+    }
+
+    /// The actual OAuth refresh call. Callers must hold `refresh_lock`.
+    async fn perform_refresh(&self) -> Result<(), ProxyError> {
         let refresh_token = self.state.read().await.refresh_token.clone();
         let endpoint = format!("{}/oauth/token", self.issuer.trim_end_matches('/'));
         let req = RefreshRequest {

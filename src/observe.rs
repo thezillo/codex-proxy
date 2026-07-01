@@ -12,10 +12,12 @@
 //!   * end — logged by the handler once the response is produced/streamed:
 //!     `endpoint`, `model`, `status`, token counts, `duration_ms`.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::http::HeaderMap;
+
+use crate::metrics::{Metrics, RequestOutcome};
 
 /// Who a request is attributed to, derived from the matched client key. Carried
 /// from the auth middleware into the handler via request extensions. `client`
@@ -30,10 +32,10 @@ pub struct AccessCtx {
 /// Non-reversible 32-bit fingerprint of a key (FNV-1a, low 32 bits), rendered
 /// as `key-XXXXXXXX`. Lets the operator tell distinct keys apart in logs
 /// without the key itself ever appearing — and without pulling in a crypto
-/// dependency. Used only when the key has no configured `key_names` label.
-pub fn key_label(key: &str, names: &HashMap<String, String>) -> String {
-    if let Some(name) = names.get(key) {
-        return name.clone();
+/// dependency. Used only when the matched `ClientKey` has no configured name.
+pub fn key_label(key: &str, name: Option<&str>) -> String {
+    if let Some(name) = name {
+        return name.to_string();
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.as_bytes() {
@@ -83,17 +85,45 @@ pub struct CompletionLog {
     ctx: AccessCtx,
     endpoint: &'static str,
     model: String,
+    /// Bounded stand-in for `model` used only for the Prometheus label — the
+    /// access log's `model` field can be an arbitrary client-supplied string
+    /// (fine, log lines aren't aggregated into label-indexed series), but a
+    /// metric label must not be: an unrecognized value would mint a new time
+    /// series per distinct string. Callers pass an already-clamped value
+    /// (e.g. server.rs's `metric_model_label`, collapsing anything outside
+    /// the supported set to `"other"`).
+    metric_model: String,
+    account: Option<Arc<str>>,
     started: Instant,
+    metrics: Arc<Metrics>,
 }
 
 impl CompletionLog {
-    pub fn new(ctx: AccessCtx, endpoint: &'static str, model: impl Into<String>) -> Self {
+    pub fn new(
+        ctx: AccessCtx,
+        endpoint: &'static str,
+        model: impl Into<String>,
+        metric_model: impl Into<String>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             ctx,
             endpoint,
             model: model.into(),
+            metric_model: metric_model.into(),
+            account: None,
             started: Instant::now(),
+            metrics,
         }
+    }
+
+    /// Record which upstream pool account served this request, once known
+    /// (after `Upstream::forward_responses` returns). The log is created
+    /// before the forward so `duration_ms` still covers the whole upstream
+    /// round trip; every call site sets this immediately after forwarding
+    /// succeeds, so `account` is effectively always `Some` by `emit()` time.
+    pub fn set_account(&mut self, account: impl Into<Arc<str>>) {
+        self.account = Some(account.into());
     }
 
     /// Emit the completion line. `usage` is `(prompt_tokens, completion_tokens)`
@@ -106,6 +136,7 @@ impl CompletionLog {
             target: "access",
             client = %self.ctx.client,
             ip = %self.ctx.ip,
+            account = %self.account.as_deref().unwrap_or("-"),
             endpoint = self.endpoint,
             model = %self.model,
             status,
@@ -116,6 +147,15 @@ impl CompletionLog {
             duration_ms,
             "request completed"
         );
+        self.metrics.record(RequestOutcome {
+            endpoint: self.endpoint,
+            client: &self.ctx.client,
+            account: self.account.as_deref().unwrap_or("-"),
+            model: &self.metric_model,
+            status,
+            usage,
+            duration_secs: duration_ms as f64 / 1000.0,
+        });
     }
 }
 
@@ -124,21 +164,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn named_key_uses_label_else_fingerprint() {
-        let mut names = HashMap::new();
-        names.insert("sk-secret".to_string(), "alice".to_string());
-        assert_eq!(key_label("sk-secret", &names), "alice");
+    fn emit_records_a_prometheus_sample_alongside_the_access_log_line() {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let ctx = AccessCtx {
+            client: "alice".to_string(),
+            ip: "1.2.3.4".to_string(),
+        };
+        let mut log = CompletionLog::new(
+            ctx,
+            "/v1/chat/completions",
+            "gpt-5.5",
+            "gpt-5.5",
+            metrics.clone(),
+        );
+        log.set_account("primary");
+        log.emit(200, Some((10, 20)));
 
-        // Unknown key -> stable, non-leaking fingerprint.
-        let fp = key_label("sk-other", &names);
+        let (_, body) = metrics.encode();
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("codexproxy_requests_total"));
+        assert!(text.contains(r#"client="alice""#));
+        assert!(text.contains(r#"account="primary""#));
+        assert!(text.contains(r#"model="gpt-5.5""#));
+        assert!(text.contains(r#"status="200""#));
+        assert!(text.contains("codexproxy_tokens_total"));
+    }
+
+    #[test]
+    fn emit_uses_the_clamped_metric_model_not_the_raw_one() {
+        // `model` (raw, client-supplied, unbounded) and `metric_model`
+        // (caller-clamped, bounded) are allowed to diverge — the metric must
+        // only ever see the clamped value, never the raw one, however wild.
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let ctx = AccessCtx {
+            client: "bob".to_string(),
+            ip: "5.6.7.8".to_string(),
+        };
+        let mut log = CompletionLog::new(
+            ctx,
+            "/v1/chat/completions",
+            "totally-unrecognized-client-supplied-garbage",
+            "other",
+            metrics.clone(),
+        );
+        log.set_account("primary");
+        log.emit(200, None);
+
+        let (_, body) = metrics.encode();
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(r#"model="other""#));
+        assert!(!text.contains("totally-unrecognized-client-supplied-garbage"));
+    }
+
+    #[test]
+    fn named_key_uses_label_else_fingerprint() {
+        assert_eq!(key_label("sk-secret", Some("alice")), "alice");
+
+        // No configured name -> stable, non-leaking fingerprint.
+        let fp = key_label("sk-other", None);
         assert!(fp.starts_with("key-"));
         assert_eq!(fp.len(), "key-".len() + 8);
         // The raw key never appears in the label.
         assert!(!fp.contains("sk-other"));
         // Deterministic.
-        assert_eq!(fp, key_label("sk-other", &names));
+        assert_eq!(fp, key_label("sk-other", None));
         // Distinct keys -> distinct fingerprints.
-        assert_ne!(key_label("sk-a", &names), key_label("sk-b", &names));
+        assert_ne!(key_label("sk-a", None), key_label("sk-b", None));
     }
 
     #[test]
