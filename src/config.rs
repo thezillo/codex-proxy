@@ -226,12 +226,16 @@ impl Default for UpstreamConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-5.6".to_string(),
+            model: "gpt-5.6-sol".to_string(),
             reasoning_effort: "medium".to_string(),
             reasoning_summary: "auto".to_string(),
             instructions: "You are a helpful coding assistant.".to_string(),
             include_reasoning: false,
-            model_aliases: HashMap::new(),
+            // The Codex upstream only accepts the flavored 5.6 slugs
+            // (gpt-5.6-sol/terra/luna) over a ChatGPT account — a bare
+            // "gpt-5.6" gets 400 "model is not supported" and would silently
+            // burn the paid fallback instead of the subscription pool.
+            model_aliases: HashMap::from([("gpt-5.6".to_string(), "gpt-5.6-sol".to_string())]),
         }
     }
 }

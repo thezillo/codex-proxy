@@ -149,10 +149,19 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Models this proxy advertises. The Codex upstream serves gpt-5.6 (default,
-/// listed first) and still accepts gpt-5.5 over a ChatGPT account. Both the
-/// list and retrieve endpoints derive their output from this slice.
-const SUPPORTED_MODELS: &[&str] = &["gpt-5.6", "gpt-5.5"];
+/// Models this proxy advertises. The Codex upstream serves the flavored 5.6
+/// slugs (sol is the real CLI's default) plus gpt-5.5 over a ChatGPT account;
+/// bare "gpt-5.6" is listed for OpenAI-style clients and resolved to
+/// gpt-5.6-sol by the default model alias on /v1/chat/completions (on
+/// /v1/responses it passes through verbatim and lands on the fallback). Both
+/// the list and retrieve endpoints derive their output from this slice.
+const SUPPORTED_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6",
+    "gpt-5.5",
+];
 
 /// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
 /// so a `GET /v1/models/{id}` retrieve and a list entry stay byte-identical.
@@ -580,12 +589,12 @@ mod tests {
         )
         .unwrap();
         let listed = &list["data"][0];
-        assert_eq!(listed["id"], "gpt-5.6");
+        assert_eq!(listed["id"], "gpt-5.6-sol");
 
         let retrieved = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/v1/models/gpt-5.6")
+                    .uri("/v1/models/gpt-5.6-sol")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -271,6 +271,16 @@ mod tests {
     }
 
     #[test]
+    fn built_in_alias_resolves_bare_gpt_5_6_to_sol() {
+        // The upstream 400s a bare "gpt-5.6" (only the flavored slugs work
+        // over a ChatGPT account), which would silently route the request to
+        // the paid fallback — the default alias map must keep catching it.
+        let defaults = DefaultsConfig::default();
+        assert_eq!(resolve_model("gpt-5.6", &defaults), "gpt-5.6-sol");
+        assert_eq!(defaults.model, "gpt-5.6-sol");
+    }
+
+    #[test]
     fn falls_back_to_default_instructions() {
         let req = parse(json!({
             "model": "gpt-5-codex",
