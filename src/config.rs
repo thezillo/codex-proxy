@@ -188,7 +188,7 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 
 /// Default Codex CLI version impersonated in the upstream User-Agent. Bump when
 /// the real Codex CLI bumps, or override via config/`CODEXPROXY_CLI_VERSION`.
-pub const DEFAULT_CLI_VERSION: &str = "0.140.0";
+pub const DEFAULT_CLI_VERSION: &str = "0.144.3";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {
@@ -226,7 +226,7 @@ impl Default for UpstreamConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-5.5".to_string(),
+            model: "gpt-5.6".to_string(),
             reasoning_effort: "medium".to_string(),
             reasoning_summary: "auto".to_string(),
             instructions: "You are a helpful coding assistant.".to_string(),

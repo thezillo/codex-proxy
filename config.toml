@@ -72,7 +72,7 @@ originator = "codex_cli_rs"
 # generated at runtime, and there is no `codex-proxy` suffix, so the UA can't
 # fingerprint the proxy. Bump to match the real Codex CLI, or override with
 # CODEXPROXY_CLI_VERSION.
-cli_version = "0.140.0"
+cli_version = "0.144.3"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600
@@ -87,7 +87,7 @@ account_cooldown_secs = 30
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]
-model = "gpt-5.5"
+model = "gpt-5.6"
 reasoning_effort = "medium"     # low | medium | high | xhigh
 reasoning_summary = "auto"
 instructions = "You are a helpful coding assistant."

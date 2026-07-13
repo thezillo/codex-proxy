@@ -149,10 +149,10 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Models this proxy advertises. The Codex upstream only serves gpt-5.5 over a
-/// ChatGPT account, so that's the single id exposed to clients. Both the list
-/// and retrieve endpoints derive their output from this slice.
-const SUPPORTED_MODELS: &[&str] = &["gpt-5.5"];
+/// Models this proxy advertises. The Codex upstream serves gpt-5.6 (default,
+/// listed first) and still accepts gpt-5.5 over a ChatGPT account. Both the
+/// list and retrieve endpoints derive their output from this slice.
+const SUPPORTED_MODELS: &[&str] = &["gpt-5.6", "gpt-5.5"];
 
 /// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
 /// so a `GET /v1/models/{id}` retrieve and a list entry stay byte-identical.
@@ -580,12 +580,12 @@ mod tests {
         )
         .unwrap();
         let listed = &list["data"][0];
-        assert_eq!(listed["id"], "gpt-5.5");
+        assert_eq!(listed["id"], "gpt-5.6");
 
         let retrieved = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/v1/models/gpt-5.5")
+                    .uri("/v1/models/gpt-5.6")
                     .body(Body::empty())
                     .unwrap(),
             )
