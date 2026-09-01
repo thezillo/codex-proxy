@@ -11,13 +11,19 @@
 //!     `/v1/responses` passthrough and for requests the client aborts midway.
 //!   * end — logged by the handler once the response is produced/streamed:
 //!     `endpoint`, `model`, `status`, token counts, `duration_ms`.
+//!
+//! Plus one conditional line, only when the ChatGPT pool failed and a
+//! fallback provider served the request instead (see `log_failover`):
+//! `reason`, the pool `account`/`status`, and `fallback_account`.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::http::HeaderMap;
 
+use crate::error::ProxyError;
 use crate::metrics::{Metrics, RequestOutcome};
+use crate::upstream::FailureReason;
 
 /// Who a request is attributed to, derived from the matched client key. Carried
 /// from the auth middleware into the handler via request extensions. `client`
@@ -68,6 +74,77 @@ pub fn client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Correlation id for a request, taken from the Codex CLI's own
+/// `x-client-request-id` (already relayed upstream, see
+/// `upstream::SESSION_IDENTITY_HEADERS`) and falling back to `session-id`.
+/// `-` when the caller sent neither — this proxy mints no id of its own, so
+/// correlation is only as good as what the client supplies.
+pub fn request_id(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-client-request-id")
+        .or_else(|| headers.get("session-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("-")
+}
+
+/// One pool -> fallback switch, as logged by `log_failover`.
+pub struct Failover<'a> {
+    pub ctx: &'a AccessCtx,
+    pub model: &'a str,
+    pub request_id: &'a str,
+    /// Why the pool's FINAL attempt failed — not a verdict on the pool as a
+    /// whole. A sweep that 429s on one account and fails to refresh a token
+    /// on another reports only the response the pool ended up with; each
+    /// account's own failure gets its own line in `Upstream::forward_responses`.
+    pub reason: FailureReason,
+    /// Last pool account tried; `None` only when the pool was empty.
+    pub pool_account: Option<&'a str>,
+    /// Status the pool returned, or `None` when it never got a response.
+    pub pool_status: Option<u16>,
+    pub fallback_account: &'a str,
+    /// The pool's own error on the no-response path. Proxy-generated text
+    /// (a status line, a `reqwest` Display, or the OAuth endpoint's error
+    /// body) — never request content or a credential — but truncated anyway,
+    /// since it's the one field here whose length isn't bounded by us.
+    pub error: Option<&'a ProxyError>,
+}
+
+/// Max chars of the two client- or upstream-supplied fields (`model`,
+/// `error`) that reach the log line. `model` is bounded only by
+/// `max_body_bytes` on the `/v1/responses` path, where it comes straight out
+/// of the caller's own body.
+const MAX_FIELD_CHARS: usize = 200;
+
+/// Emit the one line explaining why the ChatGPT pool didn't serve a request
+/// that a fallback provider then did. On the `access` target — not a target
+/// of its own: the default `EnvFilter` is built from an explicit directive
+/// list (`codex_proxy=…,access=info,…`), so a fresh target name would be
+/// filtered out entirely rather than defaulting to on.
+pub fn log_failover(f: Failover<'_>) {
+    tracing::warn!(
+        target: "access",
+        client = %f.ctx.client,
+        ip = %f.ctx.ip,
+        request_id = %f.request_id,
+        model = %truncate(f.model),
+        reason = f.reason.as_str(),
+        account = %f.pool_account.unwrap_or("-"),
+        status = f.pool_status.unwrap_or(0),
+        fallback_account = %f.fallback_account,
+        error = %f.error.map(|e| truncate(&e.to_string())).unwrap_or_default(),
+        "pool failed, served by fallback provider"
+    );
+}
+
+pub(crate) fn truncate(s: &str) -> String {
+    match s.char_indices().nth(MAX_FIELD_CHARS) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
+}
+
 /// Caller's User-Agent, or `?` when absent.
 pub fn user_agent(headers: &HeaderMap) -> String {
     headers
@@ -115,6 +192,12 @@ impl CompletionLog {
             started: Instant::now(),
             metrics,
         }
+    }
+
+    /// Who this request is attributed to — so a caller holding the log can
+    /// reuse the same identity for the failover line without cloning it.
+    pub fn ctx(&self) -> &AccessCtx {
+        &self.ctx
     }
 
     /// Record which upstream pool account served this request, once known

@@ -219,7 +219,7 @@ issued it, so it's dropped instead of replayed against the wrong account.
 ## Logging & token usage
 
 Every authenticated request emits two lines under the `access` log target, so
-you can see **who** is spending tokens:
+you can see **who** is spending tokens (plus a third on failover, below):
 
 ```
 request accepted   client=alice ip=1.2.3.4 ua=... method=POST path=/v1/chat/completions
@@ -236,6 +236,43 @@ request completed  client=alice account=primary endpoint=/v1/chat/completions mo
 - Both `/v1/chat/completions` and the `/v1/responses` passthrough report
   token usage.
 - Prompts and response bodies are never logged, only metadata.
+
+A third `access` line appears only when the ChatGPT pool failed and a
+fallback provider served the request instead — it's the one place that says
+*why* the pool didn't serve it:
+
+```
+pool failed, served by fallback provider  client=alice ip=1.2.3.4 request_id=... \
+                   model=gpt-5.6-sol reason=rate_limit account=primary status=429 \
+                   fallback_account=openrouter error=
+```
+
+- `reason` is a normalized category, so it can be grouped on: `rate_limit`,
+  `auth`, `timeout`, `capacity`, `upstream_5xx`, `bad_request`, `transport`,
+  `unknown`.
+- `account`/`status` are the LAST pool account tried and the status it
+  returned. `status=0` means it never returned one — `transport`/`timeout`,
+  but also `auth`, which is the revoked-session case (our own token refresh
+  failed, as opposed to a 401/403 coming back from upstream). `error` carries
+  the bounded message on those paths.
+- `reason` describes the pool's *final* attempt, not a verdict on the whole
+  pool: a sweep that hits 429 on one account and a dead token on another
+  reports only what the pool ended up returning. Each account's own failure
+  gets its own `account failed…` line, so grep those to see the rest.
+- `request_id` comes from the client's own `x-client-request-id` (or
+  `session-id`), `-` when it sent neither — this proxy mints no id of its own.
+- No switch, no line: if the fallback chain has nothing for the request, the
+  pool's own response is returned unchanged. Careful — when the pool got no
+  response at all, the request fails before any completion line is emitted, so
+  it produces no `access` line and no Prometheus sample either; the only trace
+  is a `request failed` warn off the `access` target.
+
+Under `format = "json"` the subscriber nests event fields one level down, so
+in Loki the labels are `fields_*`:
+
+```logql
+{app="codex-proxy"} | json | fields_reason != "" | line_format "{{.fields_client}} {{.fields_reason}} {{.fields_fallback_account}}"
+```
 
 Set `CODEXPROXY_LOG_FORMAT=json` for one structured object per line if you
 want to aggregate it. The `access` target stays at `info` regardless of the
@@ -292,6 +329,10 @@ declared provider ends up with an empty key.
 
 Fallback requests never carry Codex/ChatGPT-specific headers, and reuse the
 `upstream.proxy` setting if one's configured.
+
+Every request that actually switches to a fallback provider logs why the
+pool refused it (`reason=`, see Logging above) — otherwise "served by
+fallback" is all you'd ever see.
 
 Fallback only fires once the *whole* pool is down, so a misconfigured
 provider stays invisible until an outage. Confirm it loaded at startup:

@@ -52,6 +52,103 @@ pub struct ForwardedResponse {
     pub account: Arc<str>,
 }
 
+/// Normalized cause of a pool failure, for the failover access-log line (and
+/// so operators can filter by `reason` rather than parsing free-form error
+/// text). Deliberately a small closed set: an unbounded label would be
+/// useless to group by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    /// 429 — the account is throttled.
+    RateLimit,
+    /// 401/403. A 401 only reaches here after `try_account`'s forced refresh
+    /// and retry already failed on this account, so it means a genuinely
+    /// dead session, not an expired access token.
+    Auth,
+    /// Client- or gateway-side timeout (408/504, or a reqwest timeout).
+    Timeout,
+    /// 503 — upstream up but refusing load.
+    Capacity,
+    /// Any other 5xx: Codex itself erroring.
+    Upstream5xx,
+    /// Any other 4xx: the request is bad for every account alike.
+    BadRequest,
+    /// Never reached the upstream at all: connection refused, DNS, TLS. A
+    /// connection that was established and then broke mid-flight sets
+    /// neither reqwest predicate and lands in `Unknown` — deliberately, see
+    /// `from_transport`.
+    Transport,
+    Unknown,
+}
+
+impl FailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::RateLimit => "rate_limit",
+            FailureReason::Auth => "auth",
+            FailureReason::Timeout => "timeout",
+            FailureReason::Capacity => "capacity",
+            FailureReason::Upstream5xx => "upstream_5xx",
+            FailureReason::BadRequest => "bad_request",
+            FailureReason::Transport => "transport",
+            FailureReason::Unknown => "unknown",
+        }
+    }
+
+    /// Classify a status the pool actually returned.
+    pub fn from_status(status: reqwest::StatusCode) -> Self {
+        match status.as_u16() {
+            429 => FailureReason::RateLimit,
+            401 | 403 => FailureReason::Auth,
+            408 | 504 => FailureReason::Timeout,
+            503 => FailureReason::Capacity,
+            _ if status.is_server_error() => FailureReason::Upstream5xx,
+            _ if status.is_client_error() => FailureReason::BadRequest,
+            _ => FailureReason::Unknown,
+        }
+    }
+
+    /// Classify a request that never produced a response. Takes the two
+    /// `reqwest::Error` predicates rather than the error itself: `reqwest`
+    /// keeps its error constructors private, so a classifier taking
+    /// `&reqwest::Error` could only be tested by standing up a fake upstream
+    /// that hangs or refuses — this way the mapping is a plain table test and
+    /// the only untested part is the one-line call at the reqwest boundary.
+    pub fn from_transport(is_timeout: bool, is_connect: bool) -> Self {
+        match (is_timeout, is_connect) {
+            (true, _) => FailureReason::Timeout,
+            (_, true) => FailureReason::Transport,
+            _ => FailureReason::Unknown,
+        }
+    }
+}
+
+/// A pool attempt that produced no usable response, carrying enough context
+/// for the failover log line: which account was last tried and why it failed.
+/// Converts into `ProxyError` for the caller that just wants to fail.
+#[derive(Debug)]
+pub struct PoolFailure {
+    pub reason: FailureReason,
+    /// Last account tried, or `None` when the pool was empty.
+    pub account: Option<Arc<str>>,
+    pub error: ProxyError,
+}
+
+impl PoolFailure {
+    fn new(reason: FailureReason, account: Option<Arc<str>>, error: ProxyError) -> Self {
+        Self {
+            reason,
+            account,
+            error,
+        }
+    }
+}
+
+impl From<PoolFailure> for ProxyError {
+    fn from(f: PoolFailure) -> Self {
+        f.error
+    }
+}
+
 impl Upstream {
     /// `accounts` is the round-robin pool in configured order: `(token
     /// manager, access-log label)` per ChatGPT account. Always non-empty —
@@ -147,11 +244,11 @@ impl Upstream {
         &self,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
-    ) -> Result<ForwardedResponse, ProxyError> {
+    ) -> Result<ForwardedResponse, PoolFailure> {
         let pool_len = self.pool.len();
         let mut tried = vec![false; pool_len];
         let mut last_response = None;
-        let mut last_err = None;
+        let mut last_err: Option<PoolFailure> = None;
 
         for _ in 0..pool_len {
             let (idx, auth_mgr, account) = self.next_account();
@@ -182,6 +279,21 @@ impl Upstream {
                     return Ok(ForwardedResponse { response, account });
                 }
                 Err(e) => {
+                    // The only failure class with no per-account line of its
+                    // own: an HTTP failure logs just above, a transport error
+                    // logs in `send_once`, but a token-refresh failure logged
+                    // nowhere at all — so an account with a revoked
+                    // refresh_token could sit dead in the pool indefinitely
+                    // while a healthy sibling served every request. The
+                    // failover line only ever names the LAST failure, so
+                    // without this a mixed sweep (429 here, dead token there)
+                    // loses the dead account entirely.
+                    tracing::warn!(
+                        %account,
+                        reason = e.reason.as_str(),
+                        error = %e.error,
+                        "account failed without a response, trying next pool account"
+                    );
                     // Also cools the account down: without this, a transport
                     // error (unlike an HTTP failure status) leaves the
                     // account "not cooling", so under concurrent load a
@@ -199,8 +311,13 @@ impl Upstream {
         // then see (and act on) the actual status/body.
         match last_response {
             Some(fwd) => Ok(fwd),
-            None => Err(last_err
-                .unwrap_or_else(|| ProxyError::Upstream("upstream account pool is empty".into()))),
+            None => Err(last_err.unwrap_or_else(|| {
+                PoolFailure::new(
+                    FailureReason::Unknown,
+                    None,
+                    ProxyError::Upstream("upstream account pool is empty".into()),
+                )
+            })),
         }
     }
 
@@ -210,11 +327,17 @@ impl Upstream {
     async fn try_account(
         &self,
         auth_mgr: &AuthManager,
-        account: &str,
+        account: &Arc<str>,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
-    ) -> Result<reqwest::Response, ProxyError> {
-        let auth = auth_mgr.headers().await?;
+    ) -> Result<reqwest::Response, PoolFailure> {
+        // A token-refresh failure is an auth failure for this account: the
+        // pool can't produce credentials for it, whatever the underlying
+        // cause (rejected refresh_token, or the OAuth endpoint being down).
+        let auth = auth_mgr
+            .headers()
+            .await
+            .map_err(|e| PoolFailure::new(FailureReason::Auth, Some(account.clone()), e))?;
         let response = self
             .send_once(&auth, body.clone(), client_headers, account)
             .await?;
@@ -223,7 +346,10 @@ impl Upstream {
         }
 
         tracing::info!(%account, "401 from upstream; forcing token refresh and retrying once");
-        let refreshed = auth_mgr.force_refresh_headers().await?;
+        let refreshed = auth_mgr
+            .force_refresh_headers()
+            .await
+            .map_err(|e| PoolFailure::new(FailureReason::Auth, Some(account.clone()), e))?;
         self.send_once(&refreshed, body, client_headers, account)
             .await
     }
@@ -233,8 +359,8 @@ impl Upstream {
         auth: &crate::auth::AuthHeaders,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
-        account: &str,
-    ) -> Result<reqwest::Response, ProxyError> {
+        account: &Arc<str>,
+    ) -> Result<reqwest::Response, PoolFailure> {
         let mut req = self
             .http
             .post(&self.responses_url)
@@ -272,7 +398,11 @@ impl Upstream {
             // failure here or a transport error becomes invisible to
             // per-account rate-limit debugging.
             tracing::warn!(%account, error = %e, "forward to responses failed");
-            ProxyError::Upstream(format!("forward to responses failed: {e}"))
+            PoolFailure::new(
+                FailureReason::from_transport(e.is_timeout(), e.is_connect()),
+                Some(account.clone()),
+                ProxyError::Upstream(format!("forward to responses failed: {e}")),
+            )
         })
     }
 }
@@ -843,5 +973,78 @@ mod tests {
             fake.rx.try_recv().is_err(),
             "acct-0 should not have been retried while cooling down"
         );
+    }
+
+    #[test]
+    fn failure_reason_classifies_upstream_statuses() {
+        use reqwest::StatusCode as S;
+        let cases = [
+            (S::TOO_MANY_REQUESTS, "rate_limit"),
+            (S::UNAUTHORIZED, "auth"),
+            (S::FORBIDDEN, "auth"),
+            (S::REQUEST_TIMEOUT, "timeout"),
+            (S::GATEWAY_TIMEOUT, "timeout"),
+            (S::SERVICE_UNAVAILABLE, "capacity"),
+            (S::INTERNAL_SERVER_ERROR, "upstream_5xx"),
+            (S::BAD_GATEWAY, "upstream_5xx"),
+            (S::BAD_REQUEST, "bad_request"),
+            (S::NOT_FOUND, "bad_request"),
+            // Not a failure shape the pool produces, but the classifier must
+            // still land somewhere groupable rather than panicking.
+            (S::FOUND, "unknown"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(
+                FailureReason::from_status(status).as_str(),
+                expected,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_reason_classifies_transport_errors() {
+        assert_eq!(
+            FailureReason::from_transport(true, false).as_str(),
+            "timeout"
+        );
+        // A timed-out connect is still a timeout: the deadline is the
+        // actionable fact, the phase it expired in isn't.
+        assert_eq!(
+            FailureReason::from_transport(true, true).as_str(),
+            "timeout"
+        );
+        assert_eq!(
+            FailureReason::from_transport(false, true).as_str(),
+            "transport"
+        );
+        // Neither predicate set — a body/decode/redirect error. Must not be
+        // silently folded into "transport", or the log stops distinguishing
+        // "couldn't reach it" from "reached it and something else broke".
+        assert_eq!(
+            FailureReason::from_transport(false, false).as_str(),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_failure_names_the_account_it_last_tried() {
+        // The no-response path is the one where the caller has no
+        // `ForwardedResponse` to read an account off — without `PoolFailure`
+        // carrying it, the failover log would attribute the failure to "-"
+        // in exactly the transport/timeout case that most needs a name.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing is listening on `addr` now
+        let upstream = test_pool(&format!("http://{addr}"), 1).await;
+
+        let result = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await;
+        let Err(failure) = result else {
+            panic!("a closed port must not yield a response");
+        };
+        assert_eq!(failure.reason, FailureReason::Transport);
+        assert_eq!(failure.account.as_deref(), Some("account-0"));
     }
 }

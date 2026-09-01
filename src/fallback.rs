@@ -144,6 +144,11 @@ impl FallbackChain {
     /// provider's failing response, so the client sees a real error rather
     /// than a synthetic one.
     ///
+    /// The client-facing model it dispatched on is returned alongside: the
+    /// `/v1/responses` passthrough never parses the body itself (it can be
+    /// many MB), so this is the only place the model is known on that path,
+    /// and the failover log would otherwise report it as `-`.
+    ///
     /// Any non-2xx from a fallback provider moves on to the next one — unlike
     /// the ChatGPT pool (`is_account_failure`, 401/403/429 only), which is a
     /// homogeneous set of accounts where a plain 400 means the request itself
@@ -152,7 +157,7 @@ impl FallbackChain {
     /// 400/422 from one doesn't imply the same from the next, and a
     /// provider's own 5xx (down/overloaded) is the canonical reason to try
     /// somewhere else.
-    pub async fn run(&self, body: Bytes) -> Option<ForwardedResponse> {
+    pub async fn run(&self, body: Bytes) -> Option<(ForwardedResponse, Arc<str>)> {
         if self.providers.is_empty() {
             return None;
         }
@@ -163,12 +168,15 @@ impl FallbackChain {
             return None;
         };
         let requested_model = parsed.get("model").and_then(serde_json::Value::as_str)?;
+        let model: Arc<str> = requested_model.into();
 
         let mut last = None;
+        let mut attempted = false;
         for provider in &self.providers {
             let Some(patched) = provider.patch_model(&parsed, requested_model) else {
                 continue;
             };
+            attempted = true;
             match provider.send(&self.http, patched).await {
                 Ok(response) => {
                     if !response.status().is_success() {
@@ -183,15 +191,31 @@ impl FallbackChain {
                         });
                         continue;
                     }
-                    return Some(ForwardedResponse {
-                        response,
-                        account: provider.name.clone(),
-                    });
+                    return Some((
+                        ForwardedResponse {
+                            response,
+                            account: provider.name.clone(),
+                        },
+                        model,
+                    ));
                 }
                 Err(_) => continue,
             }
         }
-        last
+        // A configured, healthy chain that no provider's `model_map` covers
+        // declines every request for that model and would otherwise do so in
+        // total silence — indistinguishable from having no fallback at all,
+        // while `FallbackChain::new`'s startup line still reports it loaded.
+        // The other ways out of this loop already log: a non-2xx warns just
+        // above, a transport error warns in `send`.
+        if !attempted {
+            tracing::warn!(
+                model = %crate::observe::truncate(&model),
+                providers = self.providers.len(),
+                "no fallback provider has a model_map entry for this model; chain declined"
+            );
+        }
+        last.map(|fwd| (fwd, model))
     }
 }
 
@@ -399,10 +423,11 @@ mod tests {
         ];
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
-        let result = chain
+        let (result, model) = chain
             .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
             .await
             .unwrap();
+        assert_eq!(&*model, "gpt-5.5");
         assert_eq!(result.response.status(), reqwest::StatusCode::OK);
         assert_eq!(&*result.account, "second");
 
@@ -425,10 +450,11 @@ mod tests {
         ];
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
-        let result = chain
+        let (result, model) = chain
             .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
             .await
             .unwrap();
+        assert_eq!(&*model, "gpt-5.5");
         assert_eq!(
             result.response.status(),
             reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -455,10 +481,11 @@ mod tests {
         ];
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
-        let result = chain
+        let (result, model) = chain
             .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
             .await
             .unwrap();
+        assert_eq!(&*model, "gpt-5.5");
         assert_eq!(result.response.status(), reqwest::StatusCode::OK);
         assert_eq!(&*result.account, "healthy");
         assert!(rx_a.recv().await.is_some());
@@ -476,10 +503,13 @@ mod tests {
         ];
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
-        let result = chain
+        let (result, model) = chain
             .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
             .await
             .unwrap();
+        // Client-facing model, not the per-provider mapped one — it's what
+        // the failover log reports for the `/v1/responses` passthrough.
+        assert_eq!(&*model, "gpt-5.5");
         assert_eq!(&*result.account, "has-mapping");
         assert!(
             rx_a.try_recv().is_err(),

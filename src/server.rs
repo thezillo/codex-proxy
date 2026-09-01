@@ -26,7 +26,7 @@ use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
     build_codex_request, collect_chat, stream_chat, tee_responses, ChatCompletionRequest,
 };
-use crate::upstream::{ForwardedResponse, Upstream};
+use crate::upstream::{FailureReason, ForwardedResponse, Upstream};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -51,22 +51,63 @@ impl AppState {
     /// pool `Err` (every account transport-errored, no response obtained at
     /// all) is treated the same way — tried against the fallback chain, with
     /// the `Err` only propagating if the chain has nothing for it either.
+    ///
+    /// Every actual pool -> fallback switch emits one `access` line naming the
+    /// normalized `reason` (see `observe::log_failover`), because otherwise a
+    /// request served by a fallback provider is indistinguishable in the logs
+    /// from one the pool never even attempted.
     async fn forward_with_fallback(
         &self,
         body: bytes::Bytes,
         client_headers: &HeaderMap,
+        ctx: &AccessCtx,
+        // `None` on `/v1/responses`, which never parses its own body.
+        model: Option<&str>,
     ) -> Result<ForwardedResponse, ProxyError> {
-        match self
+        let pool_result = match self
             .upstream
             .forward_responses(body.clone(), client_headers)
             .await
         {
-            Ok(fwd) if fwd.response.status().is_success() => Ok(fwd),
-            Ok(fwd) => Ok(self.fallback.run(body).await.unwrap_or(fwd)),
-            Err(pool_err) => match self.fallback.run(body).await {
-                Some(fallback_fwd) => Ok(fallback_fwd),
-                None => Err(pool_err),
-            },
+            Ok(fwd) if fwd.response.status().is_success() => return Ok(fwd),
+            other => other,
+        };
+
+        match self.fallback.run(body).await {
+            Some((fallback_fwd, dispatched_model)) => {
+                // Status and error are mutually exclusive: a status exists iff
+                // the pool got a response back, an error iff it didn't.
+                let (reason, pool_account, pool_status, error) = match &pool_result {
+                    Ok(fwd) => (
+                        FailureReason::from_status(fwd.response.status()),
+                        Some(&*fwd.account),
+                        Some(fwd.response.status().as_u16()),
+                        None,
+                    ),
+                    Err(f) => (f.reason, f.account.as_deref(), None, Some(&f.error)),
+                };
+                observe::log_failover(observe::Failover {
+                    ctx,
+                    // The chain parsed the body to route it, so it knows the
+                    // model even where the passthrough handler doesn't.
+                    model: model.unwrap_or(&dispatched_model),
+                    request_id: observe::request_id(client_headers),
+                    reason,
+                    pool_account,
+                    pool_status,
+                    fallback_account: &fallback_fwd.account,
+                    error,
+                });
+                Ok(fallback_fwd)
+            }
+            // Chain empty, no provider mapped for this model, every provider
+            // transport-errored, or a body the chain couldn't parse a model
+            // out of: no switch happened, so no failover line. Note this is
+            // NOT fully covered by the request's own access line — on the
+            // `Err` path the handler bails before `CompletionLog::emit`, so
+            // the only artifact is `ProxyError`'s own warn, off the `access`
+            // target and without client/account/reason.
+            None => pool_result.map_err(ProxyError::from),
         }
     }
 }
@@ -225,7 +266,9 @@ async fn responses(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
-    let fwd = state.forward_with_fallback(body, &headers).await?;
+    let fwd = state
+        .forward_with_fallback(body, &headers, &ctx, None)
+        .await?;
     let upstream = fwd.response;
 
     let status =
@@ -294,7 +337,9 @@ async fn chat_completions(
     let bytes = serde_json::to_vec(&codex_body)
         .map_err(|e| ProxyError::Internal(format!("serialize codex request: {e}")))?;
 
-    let fwd = state.forward_with_fallback(bytes.into(), &headers).await?;
+    let fwd = state
+        .forward_with_fallback(bytes.into(), &headers, log.ctx(), Some(&echo_model))
+        .await?;
     log.set_account(fwd.account);
     let upstream = fwd.response;
 
