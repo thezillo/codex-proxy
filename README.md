@@ -51,7 +51,7 @@ with `curl localhost:8787/health` — that endpoint needs no auth.
 empty; after that the rotated token on the volume wins, so the env var is
 harmless on later restarts but also can't be used to *replace* credentials.
 
-Image tags: `latest`, `v0.2.3`, `sha-<commit>` (GHCR, built on push to `main`
+Image tags: `latest`, `v0.2.4`, `sha-<commit>` (GHCR, built on push to `main`
 and on `v*` tags). Pin a digest for anything you care about.
 
 ## Full run (named keys, metrics, fallback)
