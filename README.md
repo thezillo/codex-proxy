@@ -6,67 +6,204 @@ credentials from `codex login`, refreshing the token as needed. Rust, single
 binary, no database. Request format and TLS fingerprint match the official
 Codex client.
 
-## Run with Docker
+What a running instance gives you:
+
+- `http://<host>:8787/v1` — an OpenAI-compatible endpoint (chat completions +
+  raw Responses passthrough), guarded by your own client API keys.
+- `http://127.0.0.1:9090/metrics` — Prometheus counters, on a separate port so
+  it stays private even when the API is public.
+- A data directory holding `auth.json` — the ChatGPT credentials and the
+  rotated refresh token. **Keep it**; it's the only stateful thing here.
+- A **~3 MiB** resident footprint. Measured on the container over a week of
+  production traffic: 2.9 MiB min, 3.2 MiB mean, 6.1 MiB peak. It's a static
+  musl binary — no interpreter, no GC, no database behind it — so it fits on
+  the smallest instance any host will sell you.
+
+## Quick start (Docker)
 
 Needs `~/.codex/auth.json` from `codex login` (the official CLI), once.
 
 ```sh
+KEY=$(openssl rand -hex 24); echo "client key: $KEY"
+
 docker run -d --name codex-proxy -p 8787:8787 \
   -v codex_data:/data \
   -e CODEXPROXY_DATA_DIR=/data \
-  -e CODEXPROXY_API_KEYS="$(openssl rand -hex 24)" \
+  -e CODEXPROXY_API_KEYS="$KEY" \
   -e CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)" \
   ghcr.io/thezillo/codex-proxy:latest
 ```
 
-Then send requests to `http://localhost:8787/v1` with the `CODEXPROXY_API_KEYS`
-value as the bearer token:
+Then send requests to `http://localhost:8787/v1` with that value as the bearer
+token:
 
 ```sh
 curl http://localhost:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5-codex","stream":true,
+  -d '{"model":"gpt-5.6-sol","stream":true,
        "messages":[{"role":"user","content":"hi"}]}'
 ```
 
-`CODEXPROXY_AUTH_JSON` seeds `auth.json` only when the volume is empty; after
-that the rotated token on the volume is used, so keep the volume.
+Omit `model` and you get `defaults.model` (`gpt-5.6-sol`). Check it's alive
+with `curl localhost:8787/health` — that endpoint needs no auth.
 
-Image tags: `latest`, `v0.1.0`, `sha-<commit>` (GHCR, built on push to `main`
-and on `v*` tags).
+`CODEXPROXY_AUTH_JSON` seeds `auth.json` only when the data directory is
+empty; after that the rotated token on the volume wins, so the env var is
+harmless on later restarts but also can't be used to *replace* credentials.
 
-## Config
+Image tags: `latest`, `v0.2.3`, `sha-<commit>` (GHCR, built on push to `main`
+and on `v*` tags). Pin a digest for anything you care about.
 
-Env vars (override `config.toml`):
+## Full run (named keys, metrics, fallback)
 
-- `CODEXPROXY_API_KEYS` — comma-separated client keys; required unless bound to loopback.
-- `CODEXPROXY_AUTH_JSON` — seed `auth.json` on first boot (primary account only).
-- `CODEXPROXY_DATA_DIR` — directory holding `auth.json` (e.g. `/data`); extra
-  ChatGPT accounts are auto-discovered as subdirectories (see Multiple ChatGPT
-  accounts below).
-- `CODEXPROXY_PROXY` — outbound proxy, `socks5://` / `http://` / `https://`.
-- `CODEXPROXY_HOST`, `CODEXPROXY_PORT` — bind address (image defaults to `0.0.0.0:8787`).
-- `CODEXPROXY_MAX_BODY_BYTES` — request body cap in bytes (default 16 MiB).
-- `CODEXPROXY_METRICS_HOST`, `CODEXPROXY_METRICS_PORT` — metrics listener (see Metrics).
-- `CODEXPROXY_CLI_VERSION` — Codex CLI version impersonated in the upstream User-Agent (OS/arch auto-detected).
-- `CODEXPROXY_LOG`, `CODEXPROXY_LOG_FORMAT` — log level and `text`/`json` output (see Logging).
+`CODEXPROXY_API_KEYS` is the quick path, but it **replaces the entire key list
+with unnamed keys** — access logs then attribute spend to a fingerprint
+(`client=key-1a2b3c4d`) instead of a name. To see *who* is spending tokens,
+declare keys in a config file instead and mount it:
 
-Or in `config.toml`:
+```sh
+cat > config.toml <<'EOF'
+[client_auth]
+require = true
+
+[[client_auth.keys]]
+key = "sk-alice-..."
+name = "alice"
+
+[[client_auth.keys]]
+# sha256 digest instead of the raw secret, so this file can be committed:
+#   printf '%s' 'sk-bob-...' | shasum -a 256
+key = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+name = "bob"
+
+[logging]
+level = "info"
+format = "json"
+EOF
+
+docker run -d --name codex-proxy \
+  --restart unless-stopped \
+  -p 8787:8787 \
+  -p 127.0.0.1:9090:9090 \
+  --memory=256m \
+  -v codex_data:/data \
+  -v "$PWD/config.toml:/config/config.toml:ro" \
+  -e CODEXPROXY_CONFIG=/config/config.toml \
+  -e CODEXPROXY_DATA_DIR=/data \
+  -e CODEXPROXY_METRICS_HOST=0.0.0.0 \
+  -e CODEXPROXY_AUTH_JSON="$(cat ~/.codex/auth.json)" \
+  ghcr.io/thezillo/codex-proxy:latest
+```
+
+`GET /health` is unauthenticated and returns 200 whenever the proxy is up —
+wire it to whatever liveness/readiness probe your orchestrator uses.
+
+Why each flag is there:
+
+| Flag | Why |
+|---|---|
+| `-p 8787:8787` | the API. The image sets `CODEXPROXY_HOST=0.0.0.0` so it's reachable outside the container |
+| `-p 127.0.0.1:9090:9090` | metrics, published to loopback only — they're unauthenticated |
+| `-e CODEXPROXY_METRICS_HOST=0.0.0.0` | needed *as well*: `metrics_host` defaults to `127.0.0.1` and deliberately does **not** inherit `host`, so without this the port publish reaches nothing |
+| `-v codex_data:/data` | `auth.json` + the rotated refresh token. Lose it and you re-`codex login` |
+| `-v .../config.toml:ro` + `CODEXPROXY_CONFIG` | the config file. Without the env var the binary looks for `./config.toml` in its working directory; if that's missing it warns once and runs on built-in defaults — i.e. a mount at the wrong path costs you the whole file, not an error |
+| `--memory=256m` | Headroom, not the baseline — steady state is the ~3 MiB above. RSS ≈ baseline + the request bodies in flight, each capped at `max_body_bytes` (16 MiB), so the limit covers a burst of large bodies. Don't go lower unless you also lower that cap |
+| `--restart unless-stopped` | see the single-instance rule below — restart, never a second instance |
+
+**Run exactly one instance per data directory.** Two processes sharing an
+`auth.json` will each refresh the token and invalidate the other's — the
+result is intermittent 401s that look like an upstream problem. Scale by
+adding accounts to the pool (below), not replicas.
+
+## Configuration reference
+
+Resolution order, lowest priority first:
+**built-in defaults → `config.toml` → `CODEXPROXY_*` env vars.**
+Anything settable by env is also settable in the file; the reverse isn't true.
+
+| Env var | `config.toml` | Default |
+|---|---|---|
+| `CODEXPROXY_CONFIG` | — (path *to* the file) | `config.toml` |
+| `CODEXPROXY_HOST` | `server.host` | `127.0.0.1` (`0.0.0.0` in the image) |
+| `CODEXPROXY_PORT` | `server.port` | `8787` |
+| `CODEXPROXY_MAX_BODY_BYTES` | `server.max_body_bytes` | `16777216` (16 MiB) |
+| `CODEXPROXY_METRICS_HOST` | `server.metrics_host` | `127.0.0.1` |
+| `CODEXPROXY_METRICS_PORT` | `server.metrics_port` | `9090` (`0` disables serving) |
+| `CODEXPROXY_API_KEYS` | `client_auth.keys` | `sk-local-changeme` placeholder |
+| `CODEXPROXY_DATA_DIR` | `upstream.data_dir` | `~/.codex` |
+| `CODEXPROXY_AUTH_JSON` | — (seed, not config) | unset |
+| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.144.3` |
+| `CODEXPROXY_PROXY` | `upstream.proxy` | unset (direct) |
+| `CODEXPROXY_LOG` | `logging.level` | `info` |
+| `CODEXPROXY_LOG_FORMAT` | `logging.format` | `text` |
+| `CODEXPROXY_FALLBACK_{NAME}_API_KEY` | `fallback[].api_key` | — |
+
+`CODEXPROXY_API_KEYS` is comma-separated and replaces the whole list; names
+are file-only. `{NAME}` in the fallback var is the provider's `name`,
+uppercased with every character outside `[A-Z0-9_]` turned into `_` —
+`azure-eastus` → `CODEXPROXY_FALLBACK_AZURE_EASTUS_API_KEY`.
+
+File-only settings, with their defaults:
 
 ```toml
-[[client_auth.keys]]
-key = "replace-me"
-name = "alice" # optional; shown in access logs instead of a fingerprint
+[client_auth]
+require = true                  # false disables auth — loopback binds only
 
-[defaults]
-model = "gpt-5-codex"
+[upstream]
+base_url = "https://chatgpt.com/backend-api"
+responses_path = "/codex/responses"
+issuer = "https://auth.openai.com"
+client_id = "app_EMoamEEZ73f0CkXaXp7hrann"   # the Codex CLI's public OAuth id
+originator = "codex_cli_rs"
+refresh_skew_secs = 300         # refresh this long before the JWT `exp`
+request_timeout_secs = 600
+connect_timeout_secs = 30
+account_cooldown_secs = 30      # skip a failed pool account this long
+# [upstream.account_names]      # label pool accounts in logs, by dir basename
+
+[defaults]                      # applied when the client omits the field
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"     # low | medium | high | xhigh
+reasoning_summary = "auto"
+instructions = "You are a helpful coding assistant."
+include_reasoning = false       # emit reasoning as `reasoning_content` deltas
+
+[defaults.model_aliases]        # NOTE: defining this REPLACES the built-in map
+"gpt-5.6" = "gpt-5.6-sol"       # ...which is exactly this one entry
 ```
+
+Two traps worth repeating, because both fail quietly:
+
+- `metrics_host` does not inherit `host`. Binding the API to `0.0.0.0` leaves
+  metrics on loopback — intentional, but it means a `/metrics` scrape from
+  another host just hangs until you set it.
+- `[defaults.model_aliases]` replaces the built-in map rather than merging
+  into it. Keep the `gpt-5.6` entry: the upstream only accepts the flavored
+  slugs and 400s a bare `gpt-5.6`, which would silently divert traffic to a
+  paid fallback.
+
+## Startup guards
+
+The proxy refuses to start — rather than serve something unsafe — when it
+would bind a **non-loopback** host with any of:
+
+- `client_auth.require = false` (no auth at all),
+- the built-in `sk-local-changeme` key still in the accepted set (it's public;
+  it exists so a loopback dev run works with no setup),
+- an empty key set (e.g. `CODEXPROXY_API_KEYS=""` wiping the list).
+
+On a loopback bind these are warnings instead. If you see `refusing to start:`
+in the logs, it's one of these three — the message names which.
 
 ## Endpoints
 
 - `POST /v1/chat/completions` — Chat Completions, translated to/from Codex Responses (stream or buffered).
 - `POST /v1/responses` — raw passthrough to the Codex Responses API.
-- `GET /v1/models`, `GET /health`.
+- `GET /v1/models`, `GET /v1/models/{id}`, `GET /health`.
+
+`/health` and the model endpoints need no auth (so they work as container
+probes); both `/v1` POST endpoints do. Advertised models: `gpt-5.6-sol`,
+`gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5`.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their
@@ -156,6 +293,13 @@ declared provider ends up with an empty key.
 Fallback requests never carry Codex/ChatGPT-specific headers, and reuse the
 `upstream.proxy` setting if one's configured.
 
+Fallback only fires once the *whole* pool is down, so a misconfigured
+provider stays invisible until an outage. Confirm it loaded at startup:
+
+```sh
+docker logs codex-proxy 2>&1 | grep -i 'fallback'
+```
+
 ## Run from source
 
 ```sh
@@ -163,7 +307,9 @@ codex login
 cargo run --release   # reads ./config.toml; override with CODEXPROXY_CONFIG
 ```
 
-Rust 1.95+. Binary at `target/release/codex-proxy`.
+Rust 1.95+. Binary at `target/release/codex-proxy`. The repo's `config.toml`
+is a commented reference listing every setting at its default — safe to run
+as-is on loopback, and the place to look when this README is too short.
 
 ## License
 
