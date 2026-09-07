@@ -24,7 +24,8 @@ use crate::fallback::FallbackChain;
 use crate::metrics::Metrics;
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
-    build_codex_request, collect_chat, stream_chat, tee_responses, ChatCompletionRequest,
+    alias_responses_model, build_codex_request, collect_chat, stream_chat, tee_responses,
+    ChatCompletionRequest,
 };
 use crate::upstream::{FailureReason, ForwardedResponse, Upstream};
 
@@ -195,9 +196,10 @@ async fn health() -> impl IntoResponse {
 /// flavored slugs (gpt-6-astra, and the 5.6 sol/terra/luna trio) plus gpt-5.5
 /// over a ChatGPT account; the bare "gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
-/// model aliases on /v1/chat/completions (on /v1/responses they pass through
-/// verbatim and land on the fallback). Both the list and retrieve endpoints
-/// derive their output from this slice.
+/// model aliases — on both POST endpoints, so a client that picks a bare name
+/// out of this very list reaches the subscription pool whichever wire API it
+/// speaks. Both the list and retrieve endpoints derive their output from this
+/// slice.
 const SUPPORTED_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6",
@@ -262,14 +264,24 @@ async fn model_by_id(Path(model): Path<String>) -> Response {
         .into_response()
 }
 
-/// Passthrough to the Codex Responses API. Streams the upstream response back
-/// to the client as-is (preserving SSE).
+/// Passthrough to the Codex Responses API. The request body is forwarded
+/// byte-for-byte unless `[defaults.model_aliases]` renames its model (see
+/// below); the upstream response streams back as-is (preserving SSE).
 async fn responses(
     State(state): State<AppState>,
     Extension(ctx): Extension<AccessCtx>,
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
+    // Codex uses this endpoint, so the model alias map has to be applied here
+    // too — otherwise a bare `gpt-6`/`gpt-5.6` (both advertised by /v1/models)
+    // 400s upstream and the request silently lands on the paid fallback. The
+    // body is only rebuilt when an alias actually fires; every other request
+    // is still forwarded byte-for-byte.
+    let body = match alias_responses_model(&body, &state.config.defaults) {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => body,
+    };
     let fwd = state
         .forward_with_fallback(body, &headers, &ctx, None)
         .await?;
@@ -1091,6 +1103,45 @@ mod tests {
             fallback_fake.rx.try_recv().is_err(),
             "fallback must not be touched when the pool succeeds"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_applies_the_model_alias_before_forwarding() {
+        // The endpoint Codex actually uses. Without this the bare name goes
+        // upstream verbatim, 400s over a ChatGPT account, and the request
+        // silently ends up on a paid fallback provider instead of the pool.
+        let pool = start_fake_upstream(StatusCode::OK, "application/json", r#"{"ok":true}"#).await;
+        let app = test_router_with_upstream(1024 * 1024, pool.base_url.clone());
+
+        let response = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6","store":false,"input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = pool.recv().await;
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(forwarded["model"], "gpt-5.6-sol");
+        // The rest of the body is the client's and must arrive unchanged.
+        assert_eq!(forwarded["store"], false);
+        assert_eq!(forwarded["input"], "hi");
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_forwards_an_unaliased_body_byte_for_byte() {
+        // No alias entry means no JSON round-trip at all: key order and
+        // formatting reach the upstream exactly as the client wrote them.
+        let pool = start_fake_upstream(StatusCode::OK, "application/json", r#"{"ok":true}"#).await;
+        let app = test_router_with_upstream(1024 * 1024, pool.base_url.clone());
+
+        const BODY: &str = r#"{"store":false,   "model":"gpt-6-astra","input":"hi"}"#;
+        let response = app.oneshot(responses_request(BODY)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = pool.recv().await;
+        assert_eq!(captured.body, BODY.as_bytes());
     }
 
     #[tokio::test]

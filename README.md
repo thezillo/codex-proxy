@@ -184,7 +184,8 @@ Two traps worth repeating, because both fail quietly:
   into it. Keep the `gpt-6` and `gpt-5.6` entries: the upstream only accepts
   the flavored slugs and 400s the bare names (`The 'gpt-6' model is not
   supported when using Codex with a ChatGPT account.`), which would silently
-  divert traffic to a paid fallback.
+  divert traffic to a paid fallback. The map applies on both POST endpoints —
+  including the `/v1/responses` passthrough, which is the one Codex uses.
 
 ## Startup guards
 
@@ -202,7 +203,11 @@ in the logs, it's one of these three — the message names which.
 ## Endpoints
 
 - `POST /v1/chat/completions` — Chat Completions, translated to/from Codex Responses (stream or buffered).
-- `POST /v1/responses` — raw passthrough to the Codex Responses API.
+- `POST /v1/responses` — passthrough to the Codex Responses API. Forwarded
+  byte-for-byte, with one exception: a `model` that `[defaults.model_aliases]`
+  maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /
+  `gpt-5.6` would otherwise 400 upstream and fall through to a paid provider.
+  A body that needs no rewrite is never even parsed into a JSON tree.
 - `GET /v1/models`, `GET /v1/models/{id}`, `GET /health`.
 
 `/health` and the model endpoints need no auth (so they work as container
@@ -324,7 +329,9 @@ the last provider's real error.
 Each provider needs a `model_map`, since the model id has to become whatever
 that provider expects — an Azure deployment name, or OpenRouter's namespaced
 id (`openai/gpt-4.1`). A model missing from the map skips that provider
-rather than guessing. See the commented example in `config.toml`.
+rather than guessing. Key it by the name sent upstream — i.e. after
+`[defaults.model_aliases]` resolution, on both endpoints. See the commented
+example in `config.toml`.
 
 A provider must be declared in `config.toml` — there's no env var that
 creates one from nothing. `CODEXPROXY_FALLBACK_{NAME}_API_KEY` only overrides

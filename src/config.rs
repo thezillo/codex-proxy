@@ -242,7 +242,10 @@ impl Default for DefaultsConfig {
             // supported" and would silently burn the paid fallback instead of
             // the subscription pool. Both generations name their flavor the
             // same way, so both need an alias onto the CLI's own default
-            // flavor (gpt-6-astra, gpt-5.6-sol).
+            // flavor (gpt-6-astra, gpt-5.6-sol). Applied on /v1/responses as
+            // well as /v1/chat/completions: Codex itself speaks the Responses
+            // wire API, so an alias that only covered the translation path
+            // would miss the client that needs it most.
             model_aliases: HashMap::from([
                 ("gpt-6".to_string(), "gpt-6-astra".to_string()),
                 ("gpt-5.6".to_string(), "gpt-5.6-sol".to_string()),

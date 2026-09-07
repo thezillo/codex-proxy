@@ -98,10 +98,12 @@ instructions = "You are a helpful coding assistant."
 # Emit Codex reasoning to the client as `reasoning_content` deltas.
 include_reasoning = false
 
-# Map client model names onto upstream model ids. NOTE: defining this section
-# replaces the built-in alias map — keep the "gpt-6" and "gpt-5.6" entries, the
-# upstream only accepts the flavored slugs (gpt-6-astra; gpt-5.6-sol/terra/luna)
-# and 400s the bare names onto the paid fallback.
+# Map client model names onto upstream model ids. Applied on BOTH POST
+# endpoints — /v1/chat/completions and the /v1/responses passthrough Codex
+# itself uses. NOTE: defining this section replaces the built-in alias map —
+# keep the "gpt-6" and "gpt-5.6" entries, the upstream only accepts the
+# flavored slugs (gpt-6-astra; gpt-5.6-sol/terra/luna) and 400s the bare names
+# onto the paid fallback.
 [defaults.model_aliases]
 "gpt-6" = "gpt-6-astra"
 "gpt-5.6" = "gpt-5.6-sol"
@@ -123,12 +125,13 @@ format = "text"
 # speak the same Responses API wire format Codex itself does — no other proxy
 # behavior changes when one is configured. None configured by default.
 #
-# model_map keys must match the "model" field actually sent upstream: for
-# /v1/chat/completions that's after `defaults.model_aliases` resolution, for
-# /v1/responses it's whatever the client itself sent. A model missing from a
-# provider's model_map means that provider is skipped for that request (never
-# guessed) — if you configure model_aliases, key model_map by the *aliased*
-# name, not the client-facing one.
+# model_map keys must match the "model" field actually sent upstream — the name
+# after `defaults.model_aliases` resolution, now on BOTH endpoints (on
+# /v1/chat/completions an id that looks like nothing real becomes
+# `defaults.model` instead; on /v1/responses it is passed through). A model
+# missing from a provider's model_map means that provider is skipped for that
+# request (never guessed) — if you configure model_aliases, key model_map by
+# the *aliased* name, not the client-facing one.
 
 # [[fallback]]
 # name = "azure"
