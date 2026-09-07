@@ -71,8 +71,9 @@ originator = "codex_cli_rs"
 # `{originator}/{cli_version} ({os} {os_version}; {arch})` — the OS/arch part is
 # generated at runtime, and there is no `codex-proxy` suffix, so the UA can't
 # fingerprint the proxy. Bump to match the real Codex CLI, or override with
-# CODEXPROXY_CLI_VERSION.
-cli_version = "0.144.3"
+# CODEXPROXY_CLI_VERSION. Keep it >= the highest `minimal_client_version` of
+# the models below (gpt-6-astra wants 0.153.0).
+cli_version = "0.153.4"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600
@@ -87,18 +88,22 @@ account_cooldown_secs = 30
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]
-model = "gpt-5.6-sol"
-reasoning_effort = "medium"     # low | medium | high | xhigh
+model = "gpt-6-astra"
+# The upstream accepts none | minimal | low | medium | high | xhigh | max.
+# ("ultra" appears in the Codex CLI's own picker but is a client-side
+# delegation mode, not an API value — sending it gets a 400.)
+reasoning_effort = "medium"
 reasoning_summary = "auto"
 instructions = "You are a helpful coding assistant."
 # Emit Codex reasoning to the client as `reasoning_content` deltas.
 include_reasoning = false
 
 # Map client model names onto upstream model ids. NOTE: defining this section
-# replaces the built-in alias map — keep the "gpt-5.6" entry, the upstream
-# only accepts the flavored slugs (gpt-5.6-sol/terra/luna) and 400s bare
-# "gpt-5.6" onto the paid fallback.
+# replaces the built-in alias map — keep the "gpt-6" and "gpt-5.6" entries, the
+# upstream only accepts the flavored slugs (gpt-6-astra; gpt-5.6-sol/terra/luna)
+# and 400s the bare names onto the paid fallback.
 [defaults.model_aliases]
+"gpt-6" = "gpt-6-astra"
 "gpt-5.6" = "gpt-5.6-sol"
 "gpt-4o" = "gpt-5-codex"
 "gpt-4.1" = "gpt-5-codex"

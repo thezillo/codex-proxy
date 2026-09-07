@@ -40,12 +40,14 @@ token:
 ```sh
 curl http://localhost:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5.6-sol","stream":true,
+  -d '{"model":"gpt-6-astra","stream":true,
        "messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Omit `model` and you get `defaults.model` (`gpt-5.6-sol`). Check it's alive
-with `curl localhost:8787/health` — that endpoint needs no auth.
+`model` is required. One that doesn't look like a real id (anything not
+starting with `gpt-`/`o`) is replaced by `defaults.model` (`gpt-6-astra`);
+`[defaults.model_aliases]` is applied first. Check the proxy is alive with
+`curl localhost:8787/health` — that endpoint needs no auth.
 
 `CODEXPROXY_AUTH_JSON` seeds `auth.json` only when the data directory is
 empty; after that the rotated token on the volume wins, so the env var is
@@ -132,7 +134,7 @@ Anything settable by env is also settable in the file; the reverse isn't true.
 | `CODEXPROXY_API_KEYS` | `client_auth.keys` | `sk-local-changeme` placeholder |
 | `CODEXPROXY_DATA_DIR` | `upstream.data_dir` | `~/.codex` |
 | `CODEXPROXY_AUTH_JSON` | — (seed, not config) | unset |
-| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.144.3` |
+| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.153.4` |
 | `CODEXPROXY_PROXY` | `upstream.proxy` | unset (direct) |
 | `CODEXPROXY_LOG` | `logging.level` | `info` |
 | `CODEXPROXY_LOG_FORMAT` | `logging.format` | `text` |
@@ -162,14 +164,15 @@ account_cooldown_secs = 30      # skip a failed pool account this long
 # [upstream.account_names]      # label pool accounts in logs, by dir basename
 
 [defaults]                      # applied when the client omits the field
-model = "gpt-5.6-sol"
-reasoning_effort = "medium"     # low | medium | high | xhigh
+model = "gpt-6-astra"
+reasoning_effort = "medium"     # none | minimal | low | medium | high | xhigh | max
 reasoning_summary = "auto"
 instructions = "You are a helpful coding assistant."
 include_reasoning = false       # emit reasoning as `reasoning_content` deltas
 
 [defaults.model_aliases]        # NOTE: defining this REPLACES the built-in map
-"gpt-5.6" = "gpt-5.6-sol"       # ...which is exactly this one entry
+"gpt-6" = "gpt-6-astra"         # ...which is exactly these two entries
+"gpt-5.6" = "gpt-5.6-sol"
 ```
 
 Two traps worth repeating, because both fail quietly:
@@ -178,9 +181,10 @@ Two traps worth repeating, because both fail quietly:
   metrics on loopback — intentional, but it means a `/metrics` scrape from
   another host just hangs until you set it.
 - `[defaults.model_aliases]` replaces the built-in map rather than merging
-  into it. Keep the `gpt-5.6` entry: the upstream only accepts the flavored
-  slugs and 400s a bare `gpt-5.6`, which would silently divert traffic to a
-  paid fallback.
+  into it. Keep the `gpt-6` and `gpt-5.6` entries: the upstream only accepts
+  the flavored slugs and 400s the bare names (`The 'gpt-6' model is not
+  supported when using Codex with a ChatGPT account.`), which would silently
+  divert traffic to a paid fallback.
 
 ## Startup guards
 
@@ -202,8 +206,8 @@ in the logs, it's one of these three — the message names which.
 - `GET /v1/models`, `GET /v1/models/{id}`, `GET /health`.
 
 `/health` and the model endpoints need no auth (so they work as container
-probes); both `/v1` POST endpoints do. Advertised models: `gpt-5.6-sol`,
-`gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5`.
+probes); both `/v1` POST endpoints do. Advertised models: `gpt-6-astra`,
+`gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5`.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their

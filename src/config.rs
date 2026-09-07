@@ -188,7 +188,13 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 
 /// Default Codex CLI version impersonated in the upstream User-Agent. Bump when
 /// the real Codex CLI bumps, or override via config/`CODEXPROXY_CLI_VERSION`.
-pub const DEFAULT_CLI_VERSION: &str = "0.144.3";
+///
+/// Keep this at or above the highest `minimal_client_version` in the Codex
+/// model catalog for the models we advertise: the catalog gates gpt-6-astra on
+/// 0.153.0, and while the upstream does not currently enforce it server-side
+/// (gpt-6-astra answers fine under an older UA), a request for a model no
+/// build of that CLI version could offer is a needless fingerprint.
+pub const DEFAULT_CLI_VERSION: &str = "0.153.4";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {
@@ -226,16 +232,21 @@ impl Default for UpstreamConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-5.6-sol".to_string(),
+            model: "gpt-6-astra".to_string(),
             reasoning_effort: "medium".to_string(),
             reasoning_summary: "auto".to_string(),
             instructions: "You are a helpful coding assistant.".to_string(),
             include_reasoning: false,
-            // The Codex upstream only accepts the flavored 5.6 slugs
-            // (gpt-5.6-sol/terra/luna) over a ChatGPT account — a bare
-            // "gpt-5.6" gets 400 "model is not supported" and would silently
-            // burn the paid fallback instead of the subscription pool.
-            model_aliases: HashMap::from([("gpt-5.6".to_string(), "gpt-5.6-sol".to_string())]),
+            // The Codex upstream only accepts the *flavored* slugs over a
+            // ChatGPT account — a bare "gpt-6"/"gpt-5.6" gets 400 "model is not
+            // supported" and would silently burn the paid fallback instead of
+            // the subscription pool. Both generations name their flavor the
+            // same way, so both need an alias onto the CLI's own default
+            // flavor (gpt-6-astra, gpt-5.6-sol).
+            model_aliases: HashMap::from([
+                ("gpt-6".to_string(), "gpt-6-astra".to_string()),
+                ("gpt-5.6".to_string(), "gpt-5.6-sol".to_string()),
+            ]),
         }
     }
 }

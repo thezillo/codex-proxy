@@ -190,13 +190,17 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Models this proxy advertises. The Codex upstream serves the flavored 5.6
-/// slugs (sol is the real CLI's default) plus gpt-5.5 over a ChatGPT account;
-/// bare "gpt-5.6" is listed for OpenAI-style clients and resolved to
-/// gpt-5.6-sol by the default model alias on /v1/chat/completions (on
-/// /v1/responses it passes through verbatim and lands on the fallback). Both
-/// the list and retrieve endpoints derive their output from this slice.
+/// Models this proxy advertises, most capable first (the order is
+/// client-visible — pickers render it as given). The Codex upstream serves the
+/// flavored slugs (gpt-6-astra, and the 5.6 sol/terra/luna trio) plus gpt-5.5
+/// over a ChatGPT account; the bare "gpt-6"/"gpt-5.6" names are listed for
+/// OpenAI-style clients and resolved to their flavored form by the default
+/// model aliases on /v1/chat/completions (on /v1/responses they pass through
+/// verbatim and land on the fallback). Both the list and retrieve endpoints
+/// derive their output from this slice.
 const SUPPORTED_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -634,12 +638,12 @@ mod tests {
         )
         .unwrap();
         let listed = &list["data"][0];
-        assert_eq!(listed["id"], "gpt-5.6-sol");
+        assert_eq!(listed["id"], "gpt-6-astra");
 
         let retrieved = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/v1/models/gpt-5.6-sol")
+                    .uri("/v1/models/gpt-6-astra")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -684,6 +688,7 @@ mod tests {
         // A metric label must be bounded regardless of what a client sends —
         // otherwise arbitrary `model` strings would mint unbounded Prometheus
         // time series (see codexproxy_requests_total{model=...}).
+        assert_eq!(super::metric_model_label("gpt-6-astra"), "gpt-6-astra");
         assert_eq!(super::metric_model_label("gpt-5.5"), "gpt-5.5");
         assert_eq!(
             super::metric_model_label("literally-anything-a-client-sends"),

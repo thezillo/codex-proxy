@@ -271,13 +271,17 @@ mod tests {
     }
 
     #[test]
-    fn built_in_alias_resolves_bare_gpt_5_6_to_sol() {
-        // The upstream 400s a bare "gpt-5.6" (only the flavored slugs work
-        // over a ChatGPT account), which would silently route the request to
-        // the paid fallback — the default alias map must keep catching it.
+    fn built_in_aliases_resolve_bare_slugs_to_their_flavor() {
+        // The upstream 400s a bare "gpt-6"/"gpt-5.6" (only the flavored slugs
+        // work over a ChatGPT account), which would silently route the request
+        // to the paid fallback — the default alias map must keep catching both
+        // generations. Verified against the live upstream, which answers
+        // `{"detail":"The 'gpt-6' model is not supported when using Codex with
+        // a ChatGPT account."}`.
         let defaults = DefaultsConfig::default();
+        assert_eq!(resolve_model("gpt-6", &defaults), "gpt-6-astra");
         assert_eq!(resolve_model("gpt-5.6", &defaults), "gpt-5.6-sol");
-        assert_eq!(defaults.model, "gpt-5.6-sol");
+        assert_eq!(defaults.model, "gpt-6-astra");
     }
 
     #[test]
