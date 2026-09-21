@@ -19,6 +19,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::{ClientKey, Config};
+use crate::embeddings::EmbeddingsUpstream;
 use crate::error::ProxyError;
 use crate::fallback::FallbackChain;
 use crate::metrics::Metrics;
@@ -35,7 +36,17 @@ pub struct AppState {
     pub upstream: Arc<Upstream>,
     pub fallback: Arc<FallbackChain>,
     pub metrics: Arc<Metrics>,
+    /// `None` until `[embeddings]` is configured; the route then answers 404.
+    pub embeddings: Option<Arc<EmbeddingsUpstream>>,
 }
+
+/// `endpoint` label/field for the embeddings route. Requests here always carry
+/// `account=<provider>` because they are routed *directly* to that provider
+/// (the ChatGPT pool has no embeddings API) — this is not a failover, and no
+/// failover log line is ever emitted for it. The infra alert "served by
+/// fallback" excludes this exact string (`endpoint!="/v1/embeddings"`); keep
+/// the two in sync.
+pub const EMBEDDINGS_ENDPOINT: &str = "/v1/embeddings";
 
 impl AppState {
     /// Try the ChatGPT account pool first; if its final response is any
@@ -126,6 +137,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/responses",
             post(responses).route_layer(auth_layer.clone()),
+        )
+        .route(
+            EMBEDDINGS_ENDPOINT,
+            post(embeddings).route_layer(auth_layer.clone()),
         )
         .route(
             "/v1/chat/completions",
@@ -398,6 +413,107 @@ fn usage_pair(chat: &serde_json::Value) -> Option<(i64, i64)> {
     ))
 }
 
+/// `POST /v1/embeddings` — direct to the configured provider, no pool, no
+/// failover; see `EMBEDDINGS_ENDPOINT`.
+async fn embeddings(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
+    body: bytes::Bytes,
+) -> Result<Response, ProxyError> {
+    let Some(upstream) = state.embeddings.as_ref() else {
+        return Err(ProxyError::NotFound(
+            "embeddings are not configured on this proxy: add an [embeddings] section \
+             naming a [[fallback]] provider (see config.toml)"
+                .into(),
+        ));
+    };
+    let mut parsed: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| ProxyError::BadRequest(format!("invalid embeddings request: {e}")))?;
+    let requested = parsed
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ProxyError::BadRequest("embeddings request must include \"model\"".into()))?
+        .to_string();
+
+    let mut log = CompletionLog::new(
+        ctx,
+        EMBEDDINGS_ENDPOINT,
+        requested.clone(),
+        upstream.metric_model_label(&requested).to_string(),
+        state.metrics.clone(),
+    );
+    // Attributed to the provider up front: there is no pool attempt whose
+    // account could be recorded first, and a rejected model should still show
+    // where it *would* have gone.
+    log.set_account(upstream.name());
+
+    let Some(mapped) = upstream.map_model(&requested) else {
+        log.emit(StatusCode::BAD_REQUEST.as_u16(), None);
+        return Err(ProxyError::BadRequest(format!(
+            "embeddings model {requested:?} is not available here; configured: {}",
+            upstream.models().join(", ")
+        )));
+    };
+    parsed["model"] = serde_json::Value::String(mapped.to_string());
+    let outbound = serde_json::to_vec(&parsed)
+        .map_err(|e| ProxyError::Internal(format!("serialize embeddings request: {e}")))?;
+
+    let response = match upstream.send(outbound.into()).await {
+        Ok(r) => r,
+        Err(e) => {
+            log.emit(StatusCode::BAD_GATEWAY.as_u16(), None);
+            return Err(e);
+        }
+    };
+    let max_body_bytes = state.config.server.max_body_bytes;
+    if !response.status().is_success() {
+        log.emit(response.status().as_u16(), None);
+        return Ok(passthrough_response(response, max_body_bytes).await);
+    }
+
+    let status = response.status().as_u16();
+    let mut json = match collect_json_capped(response, max_body_bytes).await {
+        Ok(v) => v,
+        Err(e) => {
+            log.emit(StatusCode::BAD_GATEWAY.as_u16(), None);
+            return Err(e);
+        }
+    };
+    let prompt_tokens = json
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_i64);
+    // Echo the id the client asked for, as chat does with `echo_model` — the
+    // provider's namespaced id (`openai/...`) is an implementation detail.
+    json["model"] = serde_json::Value::String(requested);
+    log.emit(status, prompt_tokens.map(|p| (p, 0)));
+    Ok(Json(json).into_response())
+}
+
+/// Buffer a 2xx JSON body, refusing (rather than truncating, unlike the
+/// error-path `passthrough_response`) anything over `max_body_bytes`: a
+/// truncated success body would reach the client as JSON that isn't.
+async fn collect_json_capped(
+    upstream: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<serde_json::Value, ProxyError> {
+    let mut body = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ProxyError::Upstream(format!("reading embeddings response: {e}")))?;
+        body.extend_from_slice(&chunk);
+        if body.len() > max_body_bytes {
+            return Err(ProxyError::Upstream(format!(
+                "embeddings response exceeded {max_body_bytes} bytes"
+            )));
+        }
+    }
+    serde_json::from_slice(&body).map_err(|e| {
+        ProxyError::Upstream(format!("embeddings provider returned invalid JSON: {e}"))
+    })
+}
+
 /// Relay an upstream `reqwest::Response` to the client verbatim: same status
 /// code, same content-type, same body. Used for error responses and the raw
 /// `/v1/responses` passthrough so client-visible semantics aren't altered.
@@ -546,9 +662,11 @@ mod tests {
 
     use super::{
         constant_time_eq, key_matches, key_secret_matches, metrics_router, router, AppState,
+        EMBEDDINGS_ENDPOINT,
     };
     use crate::auth::AuthManager;
     use crate::config::{ClientKey, Config};
+    use crate::embeddings::EmbeddingsUpstream;
     use crate::fallback::FallbackChain;
     use crate::metrics::Metrics;
     use crate::test_support::write_test_auth_json;
@@ -926,7 +1044,206 @@ mod tests {
             upstream,
             fallback,
             metrics,
+            embeddings: None,
         })
+    }
+
+    /// Pool pointed at the same fake (never used by the embeddings route), one
+    /// `[[fallback]]` provider `fb` at `provider_base_url`, and `[embeddings]`
+    /// routed to it. Returns the metrics too, so tests can read the labels.
+    fn test_router_with_embeddings(provider_base_url: String) -> (axum::Router, Arc<Metrics>) {
+        let mut config = Config::default();
+        config.client_auth.keys = vec![bare_key("test-key")];
+        config.upstream.base_url = provider_base_url.clone();
+        config.fallback = vec![fallback_provider_cfg("fb", &provider_base_url)];
+        config.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "fb".to_string(),
+            path: "/embeddings".to_string(),
+            model_map: [(
+                "text-embedding-3-small".to_string(),
+                "openai/text-embedding-3-small".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        let http = reqwest::Client::new();
+        let auth = AuthManager::load(
+            &config.upstream,
+            write_test_auth_json("acct_test"),
+            http.clone(),
+        )
+        .expect("load test auth");
+        let upstream = Arc::new(Upstream::new(
+            &config.upstream,
+            http.clone(),
+            vec![(auth, "test-account".to_string())],
+        ));
+        let fallback = Arc::new(
+            FallbackChain::new(http.clone(), &config.fallback).expect("build fallback chain"),
+        );
+        let embeddings = EmbeddingsUpstream::from_config(&config, http)
+            .expect("build embeddings upstream")
+            .map(Arc::new);
+        let metrics = Arc::new(Metrics::new().expect("build metrics"));
+
+        let app = router(AppState {
+            config: Arc::new(config),
+            upstream,
+            fallback,
+            metrics: metrics.clone(),
+            embeddings,
+        });
+        (app, metrics)
+    }
+
+    fn embeddings_request(body: &'static str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(EMBEDDINGS_ENDPOINT)
+            .header("Authorization", "Bearer test-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    const EMBEDDINGS_OK: &str = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"openai/text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#;
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn embeddings_go_direct_to_the_provider_and_echo_the_requested_model() {
+        let fake = start_fake_upstream(StatusCode::OK, "application/json", EMBEDDINGS_OK).await;
+        let (app, metrics) = test_router_with_embeddings(fake.base_url.clone());
+
+        let response = app
+            .oneshot(embeddings_request(
+                r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["usage"]["prompt_tokens"], 5);
+        assert_eq!(body["data"][0]["embedding"][1], 0.2);
+
+        let captured = fake.recv().await;
+        assert_eq!(
+            captured.authorization.as_deref(),
+            Some("Bearer fallback-key"),
+            "provider auth_style=bearer must be honoured"
+        );
+        assert_eq!(captured.accept.as_deref(), Some("application/json"));
+        assert!(
+            captured.account_id.is_none() && captured.originator.is_none(),
+            "no ChatGPT/Codex headers may reach a third-party provider"
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(sent["model"], "openai/text-embedding-3-small");
+        assert_eq!(sent["input"], "hi");
+
+        // The mark the infra alert keys on: endpoint, with the provider as
+        // account — and tokens booked on the prompt side only.
+        let text = String::from_utf8(metrics.encode().1).unwrap();
+        let requests_line = text
+            .lines()
+            .find(|l| l.starts_with("codexproxy_requests_total{"))
+            .expect("requests series");
+        for needle in [
+            r#"endpoint="/v1/embeddings""#,
+            r#"account="fb""#,
+            r#"model="text-embedding-3-small""#,
+            r#"status="200""#,
+        ] {
+            assert!(
+                requests_line.contains(needle),
+                "{needle} in {requests_line}"
+            );
+        }
+        let prompt_line = text
+            .lines()
+            .find(|l| l.starts_with("codexproxy_tokens_total{") && l.contains(r#"kind="prompt""#))
+            .expect("prompt tokens series");
+        assert!(prompt_line.ends_with(" 5"), "{prompt_line}");
+        let completion_line = text
+            .lines()
+            .find(|l| {
+                l.starts_with("codexproxy_tokens_total{") && l.contains(r#"kind="completion""#)
+            })
+            .expect("completion tokens series");
+        assert!(completion_line.ends_with(" 0"), "{completion_line}");
+    }
+
+    #[tokio::test]
+    async fn embeddings_unmapped_model_is_rejected_before_reaching_the_provider() {
+        let mut fake = start_fake_upstream(StatusCode::OK, "application/json", EMBEDDINGS_OK).await;
+        let (app, _metrics) = test_router_with_embeddings(fake.base_url.clone());
+
+        let response = app
+            .oneshot(embeddings_request(
+                r#"{"model":"text-embedding-3-large","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("text-embedding-3-large"), "{message}");
+        assert!(message.contains("text-embedding-3-small"), "{message}");
+        assert!(
+            fake.rx.try_recv().is_err(),
+            "an unmapped model must never be sent to the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_unconfigured_is_a_json_404() {
+        let fake = start_fake_upstream(StatusCode::OK, "application/json", "{}").await;
+        let app = test_router_with_upstream(1024 * 1024, fake.base_url.clone());
+
+        let response = app
+            .oneshot(embeddings_request(
+                r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("[embeddings]"));
+    }
+
+    #[tokio::test]
+    async fn embeddings_provider_error_status_is_relayed_unchanged() {
+        let fake = start_fake_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            r#"{"error":{"message":"slow down"}}"#,
+        )
+        .await;
+        let (app, metrics) = test_router_with_embeddings(fake.base_url.clone());
+
+        let response = app
+            .oneshot(embeddings_request(
+                r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["message"], "slow down");
+
+        let text = String::from_utf8(metrics.encode().1).unwrap();
+        assert!(text.contains(r#"status="429""#), "{text}");
     }
 
     /// Like `test_router_with_upstream`, but with a configurable fallback
@@ -962,6 +1279,7 @@ mod tests {
             upstream,
             fallback,
             metrics,
+            embeddings: None,
         })
     }
 
@@ -1026,6 +1344,9 @@ mod tests {
         let app = Router::new()
             .route("/codex/responses", post(fake_responses))
             .route("/responses", post(fake_responses))
+            // ...and the `[embeddings]` default path, so it can also stand in
+            // for the direct embeddings provider.
+            .route("/embeddings", post(fake_responses))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1331,6 +1652,7 @@ mod tests {
             upstream,
             fallback,
             metrics: metrics.clone(),
+            embeddings: None,
         });
         let metrics_app = metrics_router(metrics);
 
@@ -1399,6 +1721,7 @@ mod tests {
             upstream,
             fallback,
             metrics: metrics.clone(),
+            embeddings: None,
         });
         let metrics_app = metrics_router(metrics);
 

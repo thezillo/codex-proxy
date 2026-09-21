@@ -208,10 +208,14 @@ in the logs, it's one of these three — the message names which.
   maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /
   `gpt-5.6` would otherwise 400 upstream and fall through to a paid provider.
   A body that needs no rewrite is never even parsed into a JSON tree.
+- `POST /v1/embeddings` — direct to the `[embeddings]` provider (the ChatGPT
+  pool has no embeddings API); `model` is mapped through its `model_map` on
+  the way out and echoed back as requested on the way in. Answers 404 until
+  `[embeddings]` is configured. See [Embeddings](#embeddings).
 - `GET /v1/models`, `GET /v1/models/{id}`, `GET /health`.
 
 `/health` and the model endpoints need no auth (so they work as container
-probes); both `/v1` POST endpoints do. Advertised models: `gpt-6-astra`,
+probes); all `/v1` POST endpoints do. Advertised models: `gpt-6-astra`,
 `gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5`.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
@@ -301,7 +305,14 @@ disables the metrics server without disabling collection.
 
 `model` is clamped to the models this proxy actually serves — anything else
 shows up as `other`, so a client sending garbage can't create unbounded
-Prometheus series. The access log still shows the real value.
+Prometheus series. The access log still shows the real value. On
+`/v1/embeddings` the bound is the `[embeddings]` `model_map` instead.
+
+`endpoint="/v1/embeddings"` always carries `account=<provider>`: that route
+is *direct* to the configured provider, never a pool failover, and never
+emits a failover log line. An alert on "served by fallback" should exclude
+it by endpoint (`endpoint!="/v1/embeddings"`), not by provider name — the
+provider is the same one a real failover would use.
 
 ## Multiple ChatGPT accounts
 
@@ -351,6 +362,34 @@ provider stays invisible until an outage. Confirm it loaded at startup:
 ```sh
 docker logs codex-proxy 2>&1 | grep -i 'fallback'
 ```
+
+## Embeddings
+
+The ChatGPT subscription backend has no embeddings API, so
+`POST /v1/embeddings` never touches the account pool. `[embeddings]` in
+`config.toml` points it at ONE already-declared `[[fallback]]` provider by
+name and reuses that provider's `base_url`, `auth_style` and `api_key`
+(including the `CODEXPROXY_FALLBACK_{NAME}_API_KEY` override), so there is
+no second secret to manage:
+
+```toml
+[embeddings]
+provider = "openrouter"          # must be a [[fallback]] name
+# path = "/embeddings"           # appended to the provider's base_url
+[embeddings.model_map]
+"text-embedding-3-small" = "openai/text-embedding-3-small"
+"text-embedding-3-large" = "openai/text-embedding-3-large"
+```
+
+Only mapped models are accepted; anything else is a 400 listing what is.
+A provider non-2xx is relayed unchanged. The response's `model` is rewritten
+back to the id the client sent. Usage is logged as prompt tokens (embeddings
+have no completion side). The proxy refuses to start if `provider` names no
+declared fallback entry or `model_map` is empty, and logs
+`embeddings configured: direct to provider` once it has loaded.
+
+This is not a failover and is not logged or alerted as one — see
+[Metrics](#metrics).
 
 ## Run from source
 

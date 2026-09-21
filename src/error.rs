@@ -13,6 +13,9 @@ pub enum ProxyError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("authentication with upstream failed: {0}")]
     UpstreamAuth(String),
 
@@ -28,6 +31,7 @@ impl ProxyError {
         match self {
             ProxyError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             ProxyError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "invalid_request_error"),
+            ProxyError::NotFound(_) => (StatusCode::NOT_FOUND, "invalid_request_error"),
             ProxyError::UpstreamAuth(_) => (StatusCode::BAD_GATEWAY, "authentication_error"),
             ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             ProxyError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),

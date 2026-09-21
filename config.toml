@@ -158,3 +158,23 @@ format = "text"
 # api_key = "sk-or-..."           # or CODEXPROXY_FALLBACK_OPENROUTER_API_KEY
 # [fallback.model_map]
 # "gpt-5.5" = "openai/gpt-4.1"
+
+# --- Embeddings -----------------------------------------------------------
+# The ChatGPT subscription backend has no embeddings API, so POST
+# /v1/embeddings never touches the account pool: it goes DIRECTLY to one of
+# the [[fallback]] providers declared above (by name), reusing its base_url,
+# auth_style and api_key (and the CODEXPROXY_FALLBACK_{NAME}_API_KEY
+# override). Not a failover — access log and metrics carry
+# account=<provider> on every such request by design; alerts on "served by
+# fallback" must exclude endpoint="/v1/embeddings" rather than the provider.
+# Unset by default: the endpoint then answers 404 with a pointer here.
+# Only models listed in model_map are accepted (anything else is a 400
+# naming the accepted ids); the proxy refuses to start if `provider` isn't a
+# declared [[fallback]] name or model_map is empty.
+
+# [embeddings]
+# provider = "openrouter"
+# path = "/embeddings"            # appended to the provider's base_url (default)
+# [embeddings.model_map]
+# "text-embedding-3-small" = "openai/text-embedding-3-small"
+# "text-embedding-3-large" = "openai/text-embedding-3-large"

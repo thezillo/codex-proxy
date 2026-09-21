@@ -4,6 +4,7 @@
 
 mod auth;
 mod config;
+mod embeddings;
 mod error;
 mod fallback;
 mod metrics;
@@ -22,6 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::auth::AuthManager;
 use crate::config::Config;
+use crate::embeddings::EmbeddingsUpstream;
 use crate::fallback::FallbackChain;
 use crate::metrics::Metrics;
 use crate::server::AppState;
@@ -89,8 +91,12 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Arc::new(Upstream::new(&config.upstream, http.clone(), accounts));
     let fallback = Arc::new(
-        FallbackChain::new(http, &config.fallback).context("configuring fallback providers")?,
+        FallbackChain::new(http.clone(), &config.fallback)
+            .context("configuring fallback providers")?,
     );
+    let embeddings = EmbeddingsUpstream::from_config(&config, http)
+        .context("configuring [embeddings]")?
+        .map(Arc::new);
     let metrics = Arc::new(Metrics::new().context("registering Prometheus metrics")?);
 
     // Guard against shipping an open door. The runtime image carries no
@@ -134,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         upstream,
         fallback,
         metrics: metrics.clone(),
+        embeddings,
     };
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

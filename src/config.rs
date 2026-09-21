@@ -20,6 +20,9 @@ pub struct Config {
     /// ...), tried in order — only once the whole ChatGPT account pool has
     /// failed. Empty by default: existing deployments are unaffected.
     pub fallback: Vec<FallbackProviderConfig>,
+    /// `POST /v1/embeddings`, routed directly to one of the `fallback` entries
+    /// above (by name). `None` (the default) leaves the endpoint answering 404.
+    pub embeddings: Option<EmbeddingsConfig>,
 }
 
 /// One fallback provider. Unlike most other config structs, this is NOT
@@ -50,6 +53,25 @@ pub struct FallbackProviderConfig {
 
 fn default_fallback_responses_path() -> String {
     "/responses".to_string()
+}
+
+/// `[embeddings]`: which declared `[[fallback]]` provider serves
+/// `POST /v1/embeddings`, and how client-facing model ids map to its own.
+/// Like `FallbackProviderConfig`, not `#[serde(default)]`'d field-by-field: a
+/// section missing `provider`/`model_map` is a misconfiguration, not a
+/// silently dead endpoint. That the provider exists is checked in
+/// `embeddings::EmbeddingsUpstream::from_config`, at startup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsConfig {
+    pub provider: String,
+    /// Appended to the provider's `base_url`, the way `responses_path` is.
+    #[serde(default = "default_embeddings_path")]
+    pub path: String,
+    pub model_map: HashMap<String, String>,
+}
+
+fn default_embeddings_path() -> String {
+    "/embeddings".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
