@@ -76,26 +76,50 @@ impl AppState {
         // `None` on `/v1/responses`, which never parses its own body.
         model: Option<&str>,
     ) -> Result<ForwardedResponse, ProxyError> {
-        let pool_result = match self
-            .upstream
-            .forward_responses(body.clone(), client_headers)
-            .await
-        {
-            Ok(fwd) if fwd.response.status().is_success() => return Ok(fwd),
-            other => other,
+        // Quota-aware short-circuit: when every pool account is known to be
+        // unusable right now (quota-exhausted, or cooling down after a
+        // failure) and there is somewhere else to send the request, don't
+        // pay for an upstream round-trip we just watched fail — go straight
+        // to the fallback chain. Only with a chain configured: without one,
+        // a shaky account is still the best (only) option, and the pool's
+        // own "try one anyway" behavior stands. The chain may still decline
+        // (no model_map for this model, every provider down) — then the pool
+        // gets its normal shot below, so a partial chain never turns into a
+        // synthetic error with zero upstream attempts.
+        let skip_reason = if self.fallback.is_empty() {
+            None
+        } else {
+            self.upstream.unavailable()
+        };
+        let pool_skipped = skip_reason.is_some();
+        let pool_result = match skip_reason {
+            Some(failure) => Err(failure),
+            None => match self
+                .upstream
+                .forward_responses(body.clone(), client_headers)
+                .await
+            {
+                Ok(fwd) if fwd.response.status().is_success() => return Ok(fwd),
+                other => other,
+            },
         };
 
-        match self.fallback.run(body).await {
+        match self.fallback.run(body.clone()).await {
             Some((fallback_fwd, dispatched_model)) => {
                 // Status and error are mutually exclusive: a status exists iff
                 // the pool got a response back, an error iff it didn't.
                 let (reason, pool_account, pool_status, error) = match &pool_result {
-                    Ok(fwd) => (
-                        FailureReason::from_status(fwd.response.status()),
-                        Some(&*fwd.account),
-                        Some(fwd.response.status().as_u16()),
-                        None,
-                    ),
+                    Ok(fwd) => {
+                        let status = fwd.response.status();
+                        // The pool's own classification (a quota 429) wins
+                        // over the bare status, so the request that
+                        // discovers an exhaustion groups with the ones
+                        // diverted after it, not with transient throttles.
+                        let reason = fwd
+                            .reason
+                            .unwrap_or_else(|| FailureReason::from_status(status));
+                        (reason, Some(&*fwd.account), Some(status.as_u16()), None)
+                    }
                     Err(f) => (f.reason, f.account.as_deref(), None, Some(&f.error)),
                 };
                 observe::log_failover(observe::Failover {
@@ -119,6 +143,14 @@ impl AppState {
             // `Err` path the handler bails before `CompletionLog::emit`, so
             // the only artifact is `ProxyError`'s own warn, off the `access`
             // target and without client/account/reason.
+            None if pool_skipped => {
+                // The chain declined and the pool was never tried: give the
+                // pool its normal chance, unavailable or not.
+                self.upstream
+                    .forward_responses(body, client_headers)
+                    .await
+                    .map_err(ProxyError::from)
+            }
             None => pool_result.map_err(ProxyError::from),
         }
     }
@@ -669,7 +701,7 @@ mod tests {
     use crate::embeddings::EmbeddingsUpstream;
     use crate::fallback::FallbackChain;
     use crate::metrics::Metrics;
-    use crate::test_support::write_test_auth_json;
+    use crate::test_support::{write_test_auth_json, USAGE_LIMIT_429_BODY};
     use crate::upstream::Upstream;
 
     fn bare_key(key: &str) -> ClientKey {
@@ -1253,9 +1285,22 @@ mod tests {
         upstream_base_url: String,
         fallback_cfgs: Vec<crate::config::FallbackProviderConfig>,
     ) -> axum::Router {
+        test_router_with_fallback_and_cooldown(upstream_base_url, fallback_cfgs, 30)
+    }
+
+    /// `account_cooldown_secs` is a parameter so the quota tests can set it
+    /// to 0: with the default 30s, any 429 makes the lone account
+    /// "unavailable" for the next request whether or not it was classified
+    /// as a quota hold, and a test can't tell the two apart.
+    fn test_router_with_fallback_and_cooldown(
+        upstream_base_url: String,
+        fallback_cfgs: Vec<crate::config::FallbackProviderConfig>,
+        account_cooldown_secs: u64,
+    ) -> axum::Router {
         let mut config = Config::default();
         config.client_auth.keys = vec![bare_key("test-key")];
         config.upstream.base_url = upstream_base_url;
+        config.upstream.account_cooldown_secs = account_cooldown_secs;
         config.fallback = fallback_cfgs;
 
         let http = reqwest::Client::new();
@@ -1501,6 +1546,179 @@ mod tests {
         let fallback_req = fallback_fake.recv().await;
         let fallback_body: serde_json::Value = serde_json::from_slice(&fallback_req.body).unwrap();
         assert_eq!(fallback_body["model"], "gpt-5.5-on-fallback");
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_pool_is_skipped_and_fallback_serves_directly() {
+        let mut pool = start_fake_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let mut fallback_fake = start_fake_upstream(
+            StatusCode::OK,
+            "application/json",
+            r#"{"ok":"from-fallback"}"#,
+        )
+        .await;
+        // Cooldown off: only the quota hold can make the pool unavailable.
+        let app = test_router_with_fallback_and_cooldown(
+            pool.base_url.clone(),
+            vec![fallback_provider_cfg("fb", &fallback_fake.base_url)],
+            0,
+        );
+
+        // First request: the pool is tried, says quota exhausted, fallback
+        // serves. This is the pre-existing failover path.
+        let response = app
+            .clone()
+            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            pool.rx.recv().await.is_some(),
+            "first request must reach the pool"
+        );
+        assert!(fallback_fake.rx.recv().await.is_some());
+
+        // Second request: the pool is known-exhausted, so it must not be
+        // touched at all — straight to the fallback provider.
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"again"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"ok":"from-fallback"}"#);
+        let fallback_req = fallback_fake.rx.recv().await.unwrap();
+        let fallback_body: serde_json::Value = serde_json::from_slice(&fallback_req.body).unwrap();
+        assert_eq!(fallback_body["input"], "again");
+        assert!(
+            pool.rx.try_recv().is_err(),
+            "quota-exhausted pool must not be hit while a fallback exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_429_does_not_short_circuit_the_pool() {
+        // Same shape as the quota test, but the 429 body is a plain throttle:
+        // no quota hold, cooldown off, so request 2 must reach the pool again.
+        // This is the discriminator that the quota test alone can't provide.
+        let mut pool = start_fake_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            r#"{"error":"rate limited"}"#,
+        )
+        .await;
+        let mut fallback_fake = start_fake_upstream(
+            StatusCode::OK,
+            "application/json",
+            r#"{"ok":"from-fallback"}"#,
+        )
+        .await;
+        let app = test_router_with_fallback_and_cooldown(
+            pool.base_url.clone(),
+            vec![fallback_provider_cfg("fb", &fallback_fake.base_url)],
+            0,
+        );
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                pool.rx.recv().await.is_some(),
+                "a throttled pool is retried every request"
+            );
+            assert!(fallback_fake.rx.recv().await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_pool_is_still_tried_when_no_chain_is_configured() {
+        // The config.rs promise: without a [[fallback]] chain the pool tries
+        // an account even when every one is cooling down — a shaky account
+        // beats refusing the request. Two requests inside one cooldown.
+        let mut pool = start_fake_upstream(
+            StatusCode::FORBIDDEN,
+            "application/json",
+            r#"{"error":"banned"}"#,
+        )
+        .await;
+        let app = test_router_with_fallback(pool.base_url.clone(), vec![]);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], br#"{"error":"banned"}"#);
+            assert!(
+                pool.rx.recv().await.is_some(),
+                "with no chain the cooling account must still be tried"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_pool_is_still_tried_when_the_chain_declines_the_model() {
+        // The chain only maps gpt-5.5. A request for another model finds no
+        // provider, so the skipped pool must get its normal shot instead of
+        // the client seeing a synthetic error with zero upstream attempts.
+        let mut pool = start_fake_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let mut fallback_fake = start_fake_upstream(
+            StatusCode::OK,
+            "application/json",
+            r#"{"ok":"from-fallback"}"#,
+        )
+        .await;
+        let app = test_router_with_fallback_and_cooldown(
+            pool.base_url.clone(),
+            vec![fallback_provider_cfg("fb", &fallback_fake.base_url)],
+            0,
+        );
+
+        // Put the pool into quota-exhausted state.
+        let response = app
+            .clone()
+            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = pool.rx.recv().await;
+        let _ = fallback_fake.rx.recv().await;
+
+        // Unmapped model: pool tried anyway, client sees the real 429.
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let pool_req = pool
+            .rx
+            .recv()
+            .await
+            .expect("pool must be tried when the chain declines");
+        let pool_body: serde_json::Value = serde_json::from_slice(&pool_req.body).unwrap();
+        assert_eq!(pool_body["model"], "gpt-6-astra");
+        assert!(fallback_fake.rx.try_recv().is_err());
     }
 
     #[tokio::test]

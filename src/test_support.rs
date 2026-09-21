@@ -9,6 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine;
 use serde_json::json;
 
+/// A `usage_limit_reached` 429 body shaped like the Codex backend's, shared
+/// by the `upstream` and `server` quota tests. `resets_at` is far in the
+/// future (2100) so the parsed hold is the clamp ceiling rather than
+/// something that could lapse mid-test.
+pub(crate) const USAGE_LIMIT_429_BODY: &str = r#"{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","plan_type":"plus","resets_at":4102444800}}"#;
+
 /// Write a fake `auth.json` (with a far-future `exp` so it never needs a
 /// refresh mid-test) into a fresh temp `codex_home`, carrying `account_id` as
 /// the id_token's `chatgpt_account_id` claim, and return that directory.

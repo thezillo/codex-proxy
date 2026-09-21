@@ -90,6 +90,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let upstream = Arc::new(Upstream::new(&config.upstream, http.clone(), accounts));
+    // Quota poller: re-checks quota-exhausted accounts against the usage
+    // endpoint so an early/manual reset puts them back in rotation before
+    // the reset time their 429 reported. Idle (no requests at all) while no
+    // account is exhausted. `quota_check_interval_secs = 0` turns it off.
+    if config.upstream.quota_check_interval_secs > 0 {
+        tracing::info!(
+            interval_secs = config.upstream.quota_check_interval_secs,
+            "quota usage polling enabled"
+        );
+        tokio::spawn(upstream.clone().quota_poll_loop());
+    }
     let fallback = Arc::new(
         FallbackChain::new(http.clone(), &config.fallback)
             .context("configuring fallback providers")?,
