@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthManager;
 use crate::config::UpstreamConfig;
@@ -20,15 +20,74 @@ struct PoolEntry {
     /// fail". A plain `std::sync::Mutex` is correct here (never held across
     /// an `.await`), not `tokio::sync::Mutex`.
     cooldown_until: Mutex<Option<Instant>>,
+    /// Set when this account's 429 said `usage_limit_reached`: a hard quota
+    /// with a known reset time, not a transient throttle. Kept apart from
+    /// `cooldown_until` because the two signals want opposite lifetimes —
+    /// a cooldown must stay short so a live account isn't lost to one
+    /// hiccup, while a quota hold must last hours or days or every request
+    /// wastes a round-trip on an account that can't serve it. Cleared early
+    /// by the quota poller (`poll_quota_once`) when the usage report says
+    /// the quota is back.
+    quota_exhausted_until: Mutex<Option<Instant>>,
+}
+
+/// How usable a pool account is right now, worst last — so selection is one
+/// `min_by_key` and "prefer a 30s-cooling account over one a week from its
+/// quota reset" is the ordering, not a second search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Availability {
+    Ready,
+    Cooling,
+    QuotaHeld,
+}
+
+/// Time left on a timer slot, `None` once it has lapsed (or was never set).
+fn remaining(slot: &Mutex<Option<Instant>>, now: Instant) -> Option<Duration> {
+    match *slot.lock().unwrap() {
+        Some(until) if now < until => Some(until - now),
+        _ => None,
+    }
 }
 
 impl PoolEntry {
-    fn is_cooling_down(&self, now: Instant) -> bool {
-        matches!(*self.cooldown_until.lock().unwrap(), Some(until) if now < until)
+    fn availability(&self, now: Instant) -> Availability {
+        if self.is_quota_exhausted(now) {
+            Availability::QuotaHeld
+        } else if remaining(&self.cooldown_until, now).is_some() {
+            Availability::Cooling
+        } else {
+            Availability::Ready
+        }
     }
 
     fn start_cooldown(&self, duration: Duration) {
         *self.cooldown_until.lock().unwrap() = Some(Instant::now() + duration);
+    }
+
+    fn is_quota_exhausted(&self, now: Instant) -> bool {
+        self.quota_hold_remaining(now).is_some()
+    }
+
+    /// Remaining hold, if any — for log lines and the pool-unavailable error.
+    fn quota_hold_remaining(&self, now: Instant) -> Option<Duration> {
+        remaining(&self.quota_exhausted_until, now)
+    }
+
+    /// Mark quota-exhausted for `hold`. Only ever extends an existing hold,
+    /// never shortens it: a poll result carrying a nearer reset than the
+    /// 429 did must not make us re-try the account sooner than either
+    /// source said it would be usable.
+    fn mark_quota_exhausted(&self, hold: Duration) {
+        let until = Instant::now() + hold;
+        let mut slot = self.quota_exhausted_until.lock().unwrap();
+        match *slot {
+            Some(existing) if existing >= until => {}
+            _ => *slot = Some(until),
+        }
+    }
+
+    fn clear_quota_exhausted(&self) {
+        *self.quota_exhausted_until.lock().unwrap() = None;
     }
 }
 
@@ -40,9 +99,30 @@ pub struct Upstream {
     next: AtomicUsize,
     account_cooldown: Duration,
     responses_url: String,
+    usage_url: String,
+    /// `None` = polling disabled (`quota_check_interval_secs = 0`).
+    quota_poll_interval: Option<Duration>,
     originator: String,
     user_agent: String,
 }
+
+/// Hold applied to a quota-exhausted account when the 429 carried no
+/// parseable reset time and polling is disabled — long enough not to
+/// hammer the account, short enough that a weekly reset is never missed by
+/// more than this.
+const QUOTA_HOLD_DEFAULT: Duration = Duration::from_secs(600);
+/// Bounds on a reset time parsed from upstream: below the floor a hold is
+/// pointless churn, above the ceiling it's almost certainly a garbage
+/// timestamp (the longest real Codex window is a week).
+const QUOTA_HOLD_MIN: Duration = Duration::from_secs(60);
+const QUOTA_HOLD_MAX: Duration = Duration::from_secs(8 * 24 * 3600);
+/// Most bytes of a 429 body we'll classify. A real usage-limit error is a
+/// few hundred bytes; anything bigger is not one and isn't classified (and,
+/// when `Content-Length` declares it up front, isn't buffered either).
+const RATE_LIMIT_BODY_MAX_BYTES: usize = 64 * 1024;
+/// Whole-request timeout for one usage poll. Background work; nothing
+/// waits on it except the next tick.
+const USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `forward_responses` produced, plus which pool account served it — so
 /// callers can attribute the request in the access log without `Upstream`
@@ -50,6 +130,12 @@ pub struct Upstream {
 pub struct ForwardedResponse {
     pub response: reqwest::Response,
     pub account: Arc<str>,
+    /// The pool's own reading of a failing response, when it knows more
+    /// than the status alone says: a 429 the pool classified as a quota
+    /// hold reports `QuotaExhausted`, so the request that *discovered* the
+    /// exhaustion groups with the ones diverted after it rather than with
+    /// transient throttles. `None` = derive from the status.
+    pub reason: Option<FailureReason>,
 }
 
 /// Normalized cause of a pool failure, for the failover access-log line (and
@@ -77,6 +163,15 @@ pub enum FailureReason {
     /// neither reqwest predicate and lands in `Unknown` — deliberately, see
     /// `from_transport`.
     Transport,
+    /// A `usage_limit_reached` 429 — the account's quota, not a throttle.
+    /// Either this request is the one that discovered it (`status=429`) or
+    /// the pool was skipped because every account is under such a hold and
+    /// a fallback chain exists to take the request (`status=0`; see
+    /// `Upstream::unavailable`).
+    QuotaExhausted,
+    /// The pool was never tried: every account is inside its short
+    /// post-failure cooldown and a fallback chain exists.
+    CoolingDown,
     Unknown,
 }
 
@@ -90,6 +185,8 @@ impl FailureReason {
             FailureReason::Upstream5xx => "upstream_5xx",
             FailureReason::BadRequest => "bad_request",
             FailureReason::Transport => "transport",
+            FailureReason::QuotaExhausted => "quota_exhausted",
+            FailureReason::CoolingDown => "cooling_down",
             FailureReason::Unknown => "unknown",
         }
     }
@@ -128,7 +225,9 @@ impl FailureReason {
 #[derive(Debug)]
 pub struct PoolFailure {
     pub reason: FailureReason,
-    /// Last account tried, or `None` when the pool was empty.
+    /// Last account tried — or, when the pool was skipped (see
+    /// `Upstream::unavailable`), the account that best explains why — or
+    /// `None` when the pool was empty.
     pub account: Option<Arc<str>>,
     pub error: ProxyError,
 }
@@ -162,11 +261,13 @@ impl Upstream {
             !accounts.is_empty(),
             "upstream account pool must not be empty"
         );
-        let responses_url = format!(
-            "{}{}",
-            cfg.base_url.trim_end_matches('/'),
-            cfg.responses_path
-        );
+        let base_url = cfg.base_url.trim_end_matches('/');
+        let responses_url = format!("{base_url}{}", cfg.responses_path);
+        let usage_url = format!("{base_url}{}", cfg.usage_path);
+        let quota_poll_interval = match cfg.quota_check_interval_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
         let user_agent = build_user_agent(&cfg.originator, &cfg.cli_version);
         // Only announce a "pool" when there actually is one — a single
         // configured account should look and log exactly like before pooling.
@@ -183,6 +284,7 @@ impl Upstream {
                 auth,
                 label: label.into(),
                 cooldown_until: Mutex::new(None),
+                quota_exhausted_until: Mutex::new(None),
             })
             .collect();
         Self {
@@ -191,28 +293,79 @@ impl Upstream {
             next: AtomicUsize::new(0),
             account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
             responses_url,
+            usage_url,
+            quota_poll_interval,
             originator: cfg.originator.clone(),
             user_agent,
         }
     }
 
-    /// Pick the next pool account, round-robin among accounts that aren't
-    /// currently cooling down (falls back to the plain round-robin pick if
-    /// every account is cooling — trying a shaky account beats refusing the
-    /// request outright). Returns the pool index too, so a caller that later
-    /// sees this account fail can start its cooldown. Returns owned handles
-    /// for the rest (not a borrow of `self`) so the caller can `.await` on
-    /// them freely.
+    /// Pick the next pool account: round-robin from the cursor, taking the
+    /// most usable one by `Availability` (ready, else merely cooling, else
+    /// quota-held — when everything is unavailable, trying a shaky account
+    /// beats refusing the request outright; a caller with somewhere better
+    /// to send it checks `unavailable` first). `min_by_key` keeps the first
+    /// best in cursor order, so a healthy pool still rotates evenly.
+    /// Returns the pool index too, so a caller that later sees this account
+    /// fail can start its cooldown. Returns owned handles for the rest (not
+    /// a borrow of `self`) so the caller can `.await` on them freely.
     fn next_account(&self) -> (usize, Arc<AuthManager>, Arc<str>) {
         let now = Instant::now();
         let len = self.pool.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
         let idx = (0..len)
             .map(|offset| (start + offset) % len)
-            .find(|&i| !self.pool[i].is_cooling_down(now))
-            .unwrap_or(start);
+            .min_by_key(|&i| self.pool[i].availability(now))
+            .expect("pool is never empty");
         let entry = &self.pool[idx];
         (idx, entry.auth.clone(), entry.label.clone())
+    }
+
+    /// `Some` when no account can serve a request right now — every one is
+    /// either quota-exhausted or inside its post-failure cooldown — so a
+    /// caller with a fallback chain can skip the pool without paying for a
+    /// round-trip it just watched fail. `None` means at least one account is
+    /// worth trying (it may still fail; this is a selection hint, not a
+    /// health guarantee).
+    ///
+    /// The reported reason and account are the worst-ranked entry's: a pool
+    /// where one account is a week from its reset and another is 30 seconds
+    /// into a cooldown is, for an operator reading the failover line, a
+    /// quota problem.
+    pub fn unavailable(&self) -> Option<PoolFailure> {
+        let now = Instant::now();
+        // Common case first, and it short-circuits on the first ready entry.
+        if self
+            .pool
+            .iter()
+            .any(|entry| entry.availability(now) == Availability::Ready)
+        {
+            return None;
+        }
+        let (entry, worst) = self
+            .pool
+            .iter()
+            .map(|entry| (entry, entry.availability(now)))
+            .max_by_key(|(_, availability)| *availability)?;
+        Some(match worst {
+            Availability::Ready => unreachable!("filtered above"),
+            Availability::QuotaHeld => PoolFailure::new(
+                FailureReason::QuotaExhausted,
+                Some(entry.label.clone()),
+                ProxyError::Upstream(format!(
+                    "every pool account is quota-exhausted (next reset in ~{}s)",
+                    entry
+                        .quota_hold_remaining(now)
+                        .unwrap_or_default()
+                        .as_secs()
+                )),
+            ),
+            Availability::Cooling => PoolFailure::new(
+                FailureReason::CoolingDown,
+                Some(entry.label.clone()),
+                ProxyError::Upstream("every pool account is cooling down".into()),
+            ),
+        })
     }
 
     /// Forward a raw JSON body to `/responses`, returning the response
@@ -268,15 +421,33 @@ impl Upstream {
                 Ok(response) => {
                     if is_account_failure(response.status()) {
                         self.pool[idx].start_cooldown(self.account_cooldown);
+                        let (response, quota) = self.classify_rate_limit(&account, response).await;
+                        if let Some(hold) = quota {
+                            self.pool[idx].mark_quota_exhausted(hold.duration);
+                            tracing::warn!(
+                                %account,
+                                hold_secs = hold.duration.as_secs(),
+                                hold_source = hold.source,
+                                "account quota exhausted; skipping it until reset or until usage polling clears it"
+                            );
+                        }
                         tracing::warn!(
                             %account,
                             status = %response.status(),
                             "account failed, trying next pool account"
                         );
-                        last_response = Some(ForwardedResponse { response, account });
+                        last_response = Some(ForwardedResponse {
+                            response,
+                            account,
+                            reason: quota.map(|_| FailureReason::QuotaExhausted),
+                        });
                         continue;
                     }
-                    return Ok(ForwardedResponse { response, account });
+                    return Ok(ForwardedResponse {
+                        response,
+                        account,
+                        reason: None,
+                    });
                 }
                 Err(e) => {
                     // The only failure class with no per-account line of its
@@ -321,6 +492,185 @@ impl Upstream {
         }
     }
 
+    /// Classify a 429: a transient throttle (`None` — the short cooldown is
+    /// the only consequence) or a `usage_limit_reached` quota error (the
+    /// hold to apply). The body has to be read to tell them apart, so it's
+    /// buffered and the response rebuilt around it — status and headers
+    /// intact — for the client, which must still see the real upstream
+    /// error when every account fails. Anything that isn't a small 429
+    /// passes through untouched. Pure with respect to pool state: the
+    /// caller, which holds the pool index, does the marking.
+    async fn classify_rate_limit(
+        &self,
+        account: &Arc<str>,
+        mut response: reqwest::Response,
+    ) -> (reqwest::Response, Option<QuotaHold>) {
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return (response, None);
+        }
+        // Only a declared oversized body is passed through unread. reqwest
+        // strips `Content-Length` when it decompresses, so a compressed or
+        // chunked 429 reports no length and is buffered whole regardless —
+        // the post-read size check below then only skips classification.
+        // Acceptable: a real usage-limit error is a few hundred bytes.
+        if response
+            .content_length()
+            .is_some_and(|len| len > RATE_LIMIT_BODY_MAX_BYTES as u64)
+        {
+            return (response, None);
+        }
+        let status = response.status();
+        let version = response.version();
+        let headers = std::mem::take(response.headers_mut());
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                // The client would have hit the same broken body; hand it an
+                // empty one with the real status rather than a synthetic 502.
+                // Without the body this 429 can't be told from a throttle,
+                // so say so: the account comes back after the short cooldown.
+                tracing::warn!(
+                    %account,
+                    error = %e,
+                    "could not read 429 body; no quota hold applied, account retried after cooldown"
+                );
+                bytes::Bytes::new()
+            }
+        };
+        let hold = (body.len() <= RATE_LIMIT_BODY_MAX_BYTES)
+            .then(|| usage_limit_hold(&headers, &body, unix_now(), self.quota_hold_default()))
+            .flatten();
+        let mut rebuilt = axum::http::Response::new(body);
+        *rebuilt.status_mut() = status;
+        *rebuilt.version_mut() = version;
+        *rebuilt.headers_mut() = headers;
+        (reqwest::Response::from(rebuilt), hold)
+    }
+
+    /// Hold for a quota-exhausted account when the 429 gave no usable reset
+    /// time: one poll interval when polling is on (the poll will re-check),
+    /// a fixed default otherwise.
+    fn quota_hold_default(&self) -> Duration {
+        self.quota_poll_interval.unwrap_or(QUOTA_HOLD_DEFAULT)
+    }
+
+    /// Run the quota poller until the process exits: every interval, re-check
+    /// each quota-exhausted account against the usage endpoint. Spawned once
+    /// from `main` when `quota_check_interval_secs > 0`.
+    pub async fn quota_poll_loop(self: Arc<Self>) {
+        let Some(interval) = self.quota_poll_interval else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; nothing is exhausted at boot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            self.poll_quota_once().await;
+        }
+    }
+
+    /// One poller pass over the pool. Only quota-exhausted accounts are
+    /// queried — a healthy account gets no extra traffic, and an account
+    /// whose hold has already lapsed is back in rotation without a check.
+    ///
+    /// Fail-open policy, decided here once: a poll that errors (endpoint
+    /// down, token refresh failed, unparseable body) changes nothing — the
+    /// account stays exhausted and its hold expires on the schedule the 429
+    /// set. Failing toward "try upstream" would reintroduce the wasted
+    /// round-trip on every request for as long as the endpoint is down;
+    /// failing toward "stay exhausted forever" could strand a recovered
+    /// account. Letting the 429's own reset time win is the middle ground.
+    pub(crate) async fn poll_quota_once(&self) {
+        let now = Instant::now();
+        // Concurrent, not one after another: a stalled usage GET for one
+        // account must not delay every other account's re-check.
+        let checks = self
+            .pool
+            .iter()
+            .filter(|e| e.is_quota_exhausted(now))
+            .map(|entry| self.poll_account(entry));
+        futures_util::future::join_all(checks).await;
+    }
+
+    async fn poll_account(&self, entry: &PoolEntry) {
+        let account = &entry.label;
+        match self.fetch_usage(&entry.auth).await {
+            Ok(report) if report.exhausted => {
+                let hold = report
+                    .reset_in
+                    .map(clamp_quota_hold)
+                    .unwrap_or_else(|| self.quota_hold_default());
+                entry.mark_quota_exhausted(hold);
+                tracing::info!(
+                    %account,
+                    used_percent = report.max_used_percent,
+                    hold_secs = hold.as_secs(),
+                    "usage poll: quota still exhausted"
+                );
+            }
+            Ok(report) => {
+                entry.clear_quota_exhausted();
+                tracing::info!(
+                    %account,
+                    used_percent = report.max_used_percent,
+                    "usage poll: quota available again, account back in rotation"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %account,
+                    error = %e,
+                    "usage poll failed; keeping quota state until the reported reset"
+                );
+            }
+        }
+    }
+
+    /// GET the usage endpoint as this account, with the same identity
+    /// headers the responses call sends — the real Codex CLI's own `/status`
+    /// makes this exact request, so it looks like nothing new.
+    async fn fetch_usage(&self, auth_mgr: &AuthManager) -> Result<UsageReport, ProxyError> {
+        let auth = auth_mgr.headers().await?;
+        let response = self
+            .identity_headers(self.http.get(&self.usage_url), &auth)
+            .header("Accept", "application/json")
+            // A poll must not inherit the client's streaming read timeout
+            // (`request_timeout_secs`, 10 minutes by default).
+            .timeout(USAGE_POLL_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Upstream(format!("usage request failed: {e}")))?;
+        let status = response.status();
+        // Content-type plus a bounded body snippet: a 200 HTML login page, a
+        // 401 for a revoked token and a 403 edge block must not all read as
+        // the same "usage poll failed" line.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ProxyError::Upstream(format!("usage body read failed: {e}")))?;
+        let snippet = || crate::observe::truncate(&String::from_utf8_lossy(&body));
+        if !status.is_success() {
+            return Err(ProxyError::Upstream(format!(
+                "usage endpoint returned {status} ({content_type}): {}",
+                snippet()
+            )));
+        }
+        parse_usage_report(&body, unix_now()).ok_or_else(|| {
+            ProxyError::Upstream(format!(
+                "usage body has no rate_limit report ({content_type}): {}",
+                snippet()
+            ))
+        })
+    }
+
     /// Try one pool account: send once, and if the upstream says 401, force a
     /// token refresh and retry once more on this same account before
     /// reporting it as failed.
@@ -354,6 +704,25 @@ impl Upstream {
             .await
     }
 
+    /// The account-identity headers every upstream call carries —
+    /// `Authorization`, `ChatGPT-Account-ID`, `originator`, `User-Agent` —
+    /// in one place so the usage poll can't drift from the responses call
+    /// and start looking like a different client.
+    fn identity_headers(
+        &self,
+        req: reqwest::RequestBuilder,
+        auth: &crate::auth::AuthHeaders,
+    ) -> reqwest::RequestBuilder {
+        let req = req
+            .header("Authorization", format!("Bearer {}", auth.bearer))
+            .header("originator", &self.originator)
+            .header("User-Agent", &self.user_agent);
+        match &auth.account_id {
+            Some(account_id) => req.header("ChatGPT-Account-ID", account_id.clone()),
+            None => req,
+        }
+    }
+
     async fn send_once(
         &self,
         auth: &crate::auth::AuthHeaders,
@@ -362,18 +731,10 @@ impl Upstream {
         account: &Arc<str>,
     ) -> Result<reqwest::Response, PoolFailure> {
         let mut req = self
-            .http
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {}", auth.bearer))
-            .header("originator", &self.originator)
-            .header("User-Agent", &self.user_agent)
+            .identity_headers(self.http.post(&self.responses_url), auth)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .body(body);
-
-        if let Some(account_id) = &auth.account_id {
-            req = req.header("ChatGPT-Account-ID", account_id.clone());
-        }
 
         for name in SESSION_IDENTITY_HEADERS {
             if let Some(value) = client_headers.get(*name) {
@@ -422,6 +783,206 @@ pub(crate) fn is_account_failure(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::FORBIDDEN
             | reqwest::StatusCode::TOO_MANY_REQUESTS
     )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn clamp_quota_hold(hold: Duration) -> Duration {
+    hold.clamp(QUOTA_HOLD_MIN, QUOTA_HOLD_MAX)
+}
+
+/// Seconds until a reset described either as an absolute unix timestamp
+/// (`resets_at`/`reset_at`) or a relative count (`resets_in_seconds`/
+/// `reset_after_seconds`). `None` when absent, unparseable, or already in
+/// the past — a past reset means "should have recovered", and the caller's
+/// default hold plus the poller decide what to do with that, not a zero.
+fn reset_in(
+    obj: &serde_json::Value,
+    absolute_key: &str,
+    relative_key: &str,
+    now: u64,
+) -> Option<Duration> {
+    let relative = obj
+        .get(relative_key)
+        .and_then(as_u64_lossy)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    let absolute = obj
+        .get(absolute_key)
+        .and_then(as_u64_lossy)
+        .filter(|at| *at > now)
+        .map(|at| Duration::from_secs(at - now));
+    relative.max(absolute)
+}
+
+/// Upstream numbers arrive as ints, floats, or (occasionally) strings.
+/// Lossy above 2^53 — irrelevant for unix seconds and second counts.
+fn as_u64_lossy(v: &serde_json::Value) -> Option<u64> {
+    as_f64_lossy(v).filter(|f| *f >= 0.0).map(|f| f as u64)
+}
+
+fn as_f64_lossy(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// A quota hold decided from a 429, with where its length came from — so
+/// the warn line can tell a genuine reset from a defaulted or clamped one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaHold {
+    pub duration: Duration,
+    /// `body` (`error.resets_at`/`resets_in_seconds`), `rate_limits` (a
+    /// per-window reset in `error.rate_limits`), `header`
+    /// (`x-codex-*-reset-after-seconds`), `default` (no usable reset at all,
+    /// or one already in the past), or `clamped` (a parsed reset outside
+    /// `QUOTA_HOLD_MIN..=QUOTA_HOLD_MAX`, almost certainly garbage).
+    pub source: &'static str,
+}
+
+/// Decide whether a 429 is a `usage_limit_reached` quota error and, if so,
+/// how long to hold the account. The body is the primary signal: the real
+/// Codex CLI keys off `error.type` there (`codex-rs/core/src/client.rs`),
+/// with `error.resets_at` (unix seconds) for the reset. `error.rate_limits`
+/// (per-window `resets_at`/`resets_in_seconds`) and the
+/// `x-codex-{primary,secondary}-reset-after-seconds` headers are consulted
+/// for the reset only, taking the latest of whatever is present: when both
+/// the 5h and the weekly window are blown, the weekly one is what matters.
+/// A quota 429 with no usable reset at all holds for `default_hold`.
+///
+/// `None` for anything else — a plain throttle 429, a body that isn't JSON,
+/// an `error.type` of something else (`usage_not_included`, an org policy
+/// block) — which keeps the existing short cooldown as the only effect.
+fn usage_limit_hold(
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+    now: u64,
+    default_hold: Duration,
+) -> Option<QuotaHold> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = parsed.get("error")?;
+    if error.get("type").and_then(serde_json::Value::as_str) != Some("usage_limit_reached") {
+        return None;
+    }
+    // Latest reset wins; on a tie the earlier-listed source keeps the label.
+    let mut best: Option<(Duration, &'static str)> = None;
+    let mut consider = |candidate: Option<Duration>, source: &'static str| {
+        if let Some(d) = candidate {
+            if best.is_none_or(|(b, _)| d > b) {
+                best = Some((d, source));
+            }
+        }
+    };
+    consider(
+        reset_in(error, "resets_at", "resets_in_seconds", now),
+        "body",
+    );
+    if let Some(windows) = error
+        .get("rate_limits")
+        .and_then(serde_json::Value::as_object)
+    {
+        for window in windows.values() {
+            consider(
+                reset_in(window, "resets_at", "resets_in_seconds", now),
+                "rate_limits",
+            );
+        }
+    }
+    for name in [
+        "x-codex-primary-reset-after-seconds",
+        "x-codex-secondary-reset-after-seconds",
+    ] {
+        let from_header = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs);
+        consider(from_header, "header");
+    }
+    Some(match best {
+        Some((parsed, source)) => {
+            let duration = clamp_quota_hold(parsed);
+            QuotaHold {
+                duration,
+                source: if duration == parsed {
+                    source
+                } else {
+                    "clamped"
+                },
+            }
+        }
+        None => QuotaHold {
+            duration: default_hold,
+            source: "default",
+        },
+    })
+}
+
+/// What one usage poll said about an account.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UsageReport {
+    /// `rate_limit.limit_reached`, or any window at/over 100%. Both windows
+    /// count: the issue that motivated this feature reads only
+    /// `primary_window` (the 5h limit) while describing the weekly limit,
+    /// which is `secondary_window` — a script that only checks one can miss
+    /// the other.
+    pub exhausted: bool,
+    /// Highest `used_percent` across windows, for the log line.
+    pub max_used_percent: f64,
+    /// Latest reset among the windows at/over 100%, relative to the `now`
+    /// the report was parsed with — the weekly window's absolute `reset_at`
+    /// must not lose to the 5h window's relative `reset_after_seconds` just
+    /// because of which field each one used.
+    pub reset_in: Option<Duration>,
+}
+
+/// Parse the `/wham/usage` payload:
+/// `rate_limit: { allowed, limit_reached, primary_window: { used_percent,
+/// reset_at | reset_after_seconds, ... }, secondary_window: { ... } }`.
+/// Field names as the Codex CLI's own `UsageResponse` deserializes them —
+/// note `reset_at` here vs `resets_at` on the 429 error; the two endpoints
+/// don't agree. `None` when there's no `rate_limit` object at all (a poll
+/// that can't be interpreted must not clear anything).
+pub(crate) fn parse_usage_report(body: &[u8], now: u64) -> Option<UsageReport> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let rate_limit = parsed.get("rate_limit")?.as_object()?;
+    let limit_reached = rate_limit
+        .get("limit_reached")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut max_used_percent: f64 = 0.0;
+    let mut reset_in = None;
+    for key in ["primary_window", "secondary_window"] {
+        let Some(window) = rate_limit.get(key).filter(|w| w.is_object()) else {
+            continue;
+        };
+        let used = window
+            .get("used_percent")
+            .and_then(as_f64_lossy)
+            .unwrap_or(0.0);
+        max_used_percent = max_used_percent.max(used);
+        if used >= 100.0 {
+            reset_in = reset_in.max(self::reset_in(
+                window,
+                "reset_at",
+                "reset_after_seconds",
+                now,
+            ));
+        }
+    }
+    Some(UsageReport {
+        exhausted: limit_reached || max_used_percent >= 100.0,
+        max_used_percent,
+        reset_in,
+    })
 }
 
 /// Client/session-identifying headers the real Codex CLI attaches to
@@ -513,7 +1074,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::test_support::write_test_auth_json;
+    use crate::test_support::{write_test_auth_json, USAGE_LIMIT_429_BODY};
 
     /// Fake upstream capturing the `ChatGPT-Account-ID` of every request it
     /// receives, in order — enough to assert a round-robin sequence. Distinct
@@ -565,12 +1126,19 @@ mod tests {
     /// Build an `Upstream` with `n` fake accounts (distinct `chatgpt_account_id`
     /// claims, labelled "account-0".."account-{n-1}") pointed at `base_url`.
     async fn test_pool(base_url: &str, n: usize) -> Upstream {
+        test_pool_with_cooldown(base_url, n, 30).await
+    }
+
+    /// `account_cooldown_secs` as a parameter: the quota tests set it to 0
+    /// so a hold can be told apart from the cooldown every failure starts.
+    async fn test_pool_with_cooldown(base_url: &str, n: usize, cooldown_secs: u64) -> Upstream {
         let mut cfg = Config::default();
         cfg.upstream.base_url = base_url.to_string();
         // Same fake server also serves /oauth/token (see ScriptedState),
         // so a forced refresh in the retry-on-401 path resolves locally
         // instead of reaching the real OpenAI OAuth endpoint.
         cfg.upstream.issuer = base_url.to_string();
+        cfg.upstream.account_cooldown_secs = cooldown_secs;
         let http = reqwest::Client::new();
 
         let mut accounts = Vec::with_capacity(n);
@@ -780,34 +1348,64 @@ mod tests {
             tokio::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<u16>>>,
         >,
         tx: mpsc::Sender<(String, u16)>,
+        /// Body every 429 carries. `{"ok":true}` by default (a plain
+        /// throttle); the quota tests swap in a `usage_limit_reached` error.
+        rate_limit_body: &'static str,
+        /// The scripted `/wham/usage` reply, `(status, body)`. `None` = 404.
+        usage: Arc<tokio::sync::Mutex<Option<(u16, &'static str)>>>,
+        usage_calls: Arc<AtomicUsize>,
     }
 
     struct ScriptedUpstream {
         base_url: String,
         rx: mpsc::Receiver<(String, u16)>,
+        usage: Arc<tokio::sync::Mutex<Option<(u16, &'static str)>>>,
+        usage_calls: Arc<AtomicUsize>,
     }
 
     impl ScriptedUpstream {
         async fn recv(&mut self) -> (String, u16) {
             self.rx.recv().await.expect("fake upstream request")
         }
+
+        /// Set the `/wham/usage` reply for every poll from now on.
+        async fn script_usage(&self, reply: (u16, &'static str)) {
+            *self.usage.lock().await = Some(reply);
+        }
+
+        fn usage_calls(&self) -> usize {
+            self.usage_calls.load(Ordering::Relaxed)
+        }
     }
 
     async fn start_scripted_upstream(
         scripts: std::collections::HashMap<&str, Vec<u16>>,
+    ) -> ScriptedUpstream {
+        start_scripted_upstream_with_429_body(scripts, r#"{"ok":true}"#).await
+    }
+
+    async fn start_scripted_upstream_with_429_body(
+        scripts: std::collections::HashMap<&str, Vec<u16>>,
+        rate_limit_body: &'static str,
     ) -> ScriptedUpstream {
         let (tx, rx) = mpsc::channel(16);
         let scripts = scripts
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.into_iter().collect()))
             .collect();
+        let usage = Arc::new(tokio::sync::Mutex::new(None));
+        let usage_calls = Arc::new(AtomicUsize::new(0));
         let state = ScriptedState {
             scripts: Arc::new(tokio::sync::Mutex::new(scripts)),
             tx,
+            rate_limit_body,
+            usage: usage.clone(),
+            usage_calls: usage_calls.clone(),
         };
         let app = Router::new()
             .route("/codex/responses", post(scripted_responses))
             .route("/oauth/token", post(scripted_oauth))
+            .route("/wham/usage", axum::routing::get(scripted_usage))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -817,6 +1415,8 @@ mod tests {
         ScriptedUpstream {
             base_url: format!("http://{addr}"),
             rx,
+            usage,
+            usage_calls,
         }
     }
 
@@ -839,10 +1439,353 @@ mod tests {
             }
         };
         state.tx.send((account_id, status)).await.unwrap();
+        let body = if status == 429 {
+            state.rate_limit_body
+        } else {
+            r#"{"ok":true}"#
+        };
         Response::builder()
             .status(status)
-            .body(Body::from(r#"{"ok":true}"#))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
             .unwrap()
+    }
+
+    async fn scripted_usage(State(state): State<ScriptedState>, headers: HeaderMap) -> Response {
+        state.usage_calls.fetch_add(1, Ordering::Relaxed);
+        // The poll must identify itself exactly like a responses call.
+        assert!(
+            headers.get("authorization").is_some(),
+            "usage poll sent no bearer"
+        );
+        assert!(
+            headers.get("chatgpt-account-id").is_some(),
+            "usage poll sent no account id"
+        );
+        let (status, body) = state.usage.lock().await.unwrap_or((404, "{}"));
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    const USAGE_EXHAUSTED: &str = r#"{"plan_type":"plus","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_after_seconds":7200,"reset_at":4102444800},"secondary_window":{"used_percent":100,"reset_at":4102444800}}}"#;
+    const USAGE_AVAILABLE: &str = r#"{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":40.5,"reset_at":4102444800},"secondary_window":{"used_percent":12,"reset_at":4102444800}}}"#;
+
+    #[tokio::test]
+    async fn usage_limit_429_marks_the_account_quota_exhausted() {
+        let mut fake = start_scripted_upstream_with_429_body(
+            std::collections::HashMap::from([("acct-0", vec![429])]),
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
+        assert!(
+            upstream.unavailable().is_none(),
+            "fresh pool must be available"
+        );
+
+        let fwd = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(fake.recv().await, ("acct-0".to_string(), 429));
+        // The client still gets the real upstream error, body intact, even
+        // though the pool read that body to classify it.
+        assert_eq!(
+            fwd.response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            fwd.response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            fwd.response.bytes().await.unwrap(),
+            USAGE_LIMIT_429_BODY.as_bytes()
+        );
+
+        let failure = upstream.unavailable().expect("pool should be unavailable");
+        assert_eq!(failure.reason, FailureReason::QuotaExhausted);
+        assert_eq!(failure.account.as_deref(), Some("account-0"));
+        assert!(
+            failure.error.to_string().contains("quota-exhausted"),
+            "{}",
+            failure.error
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_429_is_a_throttle_not_a_quota_hold() {
+        let mut fake =
+            start_scripted_upstream(std::collections::HashMap::from([("acct-0", vec![429])])).await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
+
+        let fwd = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            fwd.response.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(fake.recv().await, ("acct-0".to_string(), 429));
+        // Cooldown is 0 here, and a plain 429 sets no quota hold: the
+        // account is immediately selectable again.
+        assert!(upstream.unavailable().is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_reports_cooling_down_when_every_account_is_in_cooldown() {
+        let mut fake =
+            start_scripted_upstream(std::collections::HashMap::from([("acct-0", vec![403])])).await;
+        // Default 30s cooldown.
+        let upstream = test_pool(&fake.base_url, 1).await;
+        let _ = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(fake.recv().await, ("acct-0".to_string(), 403));
+
+        let failure = upstream.unavailable().expect("pool should be unavailable");
+        assert_eq!(failure.reason, FailureReason::CoolingDown);
+    }
+
+    #[tokio::test]
+    async fn quota_hold_skips_the_account_while_a_sibling_serves() {
+        let mut fake = start_scripted_upstream_with_429_body(
+            std::collections::HashMap::from([("acct-0", vec![429]), ("acct-1", vec![200])]),
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 2, 0).await;
+
+        // First request: acct-0 quota 429 -> failover to acct-1.
+        let fwd = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(&*fwd.account, "account-1");
+        assert_eq!(fake.recv().await, ("acct-0".to_string(), 429));
+        assert_eq!(fake.recv().await, ("acct-1".to_string(), 200));
+        // The pool as a whole is still available — acct-1 is fine.
+        assert!(upstream.unavailable().is_none());
+
+        // Second request: round-robin would land on acct-0, but its quota
+        // hold (not a cooldown — those are off here) skips it.
+        let fwd = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(&*fwd.account, "account-1");
+        assert_eq!(fake.recv().await, ("acct-1".to_string(), 200));
+        assert!(
+            fake.rx.try_recv().is_err(),
+            "acct-0 must not be retried under quota hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_clears_quota_hold_when_usage_reports_headroom() {
+        let mut fake = start_scripted_upstream_with_429_body(
+            std::collections::HashMap::from([("acct-0", vec![429])]),
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
+        let _ = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        let _ = fake.recv().await;
+        assert!(upstream.unavailable().is_some());
+
+        // Still exhausted: state kept.
+        fake.script_usage((200, USAGE_EXHAUSTED)).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 1);
+        assert_eq!(
+            upstream.unavailable().map(|f| f.reason),
+            Some(FailureReason::QuotaExhausted)
+        );
+
+        // Endpoint broken: fail open toward the 429's own reset, state kept.
+        fake.script_usage((500, "boom")).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 2);
+        assert!(upstream.unavailable().is_some());
+
+        // Unparseable 200: same — a poll we can't read must not clear anything.
+        fake.script_usage((200, r#"{"plan_type":"plus"}"#)).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 3);
+        assert!(upstream.unavailable().is_some());
+
+        // Headroom is back (early/manual reset): cleared, account in rotation.
+        fake.script_usage((200, USAGE_AVAILABLE)).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 4);
+        assert!(upstream.unavailable().is_none());
+
+        // Nothing exhausted any more: the poller stops asking.
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 4, "healthy accounts must not be polled");
+    }
+
+    #[test]
+    fn usage_limit_hold_classifies_the_429_body() {
+        let headers = HeaderMap::new();
+        let now = 1_000_000;
+        let default = Duration::from_secs(600);
+        let hold = |headers: &HeaderMap, body: &str| {
+            usage_limit_hold(headers, body.as_bytes(), now, default)
+        };
+        let expect = |secs: u64, source: &'static str| {
+            Some(QuotaHold {
+                duration: Duration::from_secs(secs),
+                source,
+            })
+        };
+
+        // Plain throttle / non-JSON / other error types: not a quota hold.
+        assert_eq!(hold(&headers, r#"{"ok":true}"#), None);
+        assert_eq!(hold(&headers, "rate limited"), None);
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_not_included","message":"x"}}"#
+            ),
+            None
+        );
+
+        // Absolute reset: held until then.
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":1003600}}"#
+            ),
+            expect(3600, "body")
+        );
+        // Relative reset (older shape).
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}"#
+            ),
+            expect(7200, "body")
+        );
+        // A zero relative count next to a valid absolute one: the absolute wins.
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":0,"resets_at":1003600}}"#
+            ),
+            expect(3600, "body")
+        );
+        // Numbers as strings or floats still parse.
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":"1003600"}}"#
+            ),
+            expect(3600, "body")
+        );
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":1003600.9}}"#
+            ),
+            expect(3600, "body")
+        );
+        // Both windows blown: the later (weekly) reset wins.
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":1003600,"rate_limits":{"primary_window":{"resets_at":1003600},"secondary_window":{"resets_at":1500000}}}}"#
+            ),
+            expect(500_000, "rate_limits")
+        );
+        // No reset at all, or one already in the past: the caller's default.
+        assert_eq!(
+            hold(&headers, r#"{"error":{"type":"usage_limit_reached"}}"#),
+            expect(600, "default")
+        );
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":5}}"#
+            ),
+            expect(600, "default")
+        );
+        // Outside the sane range: clamped, and labelled as such.
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_at":99999999999}}"#
+            ),
+            Some(QuotaHold {
+                duration: QUOTA_HOLD_MAX,
+                source: "clamped"
+            })
+        );
+        assert_eq!(
+            hold(
+                &headers,
+                r#"{"error":{"type":"usage_limit_reached","resets_in_seconds":5}}"#
+            ),
+            Some(QuotaHold {
+                duration: QUOTA_HOLD_MIN,
+                source: "clamped"
+            })
+        );
+        // Header-only reset (body says quota, no timestamp in it).
+        let mut with_header = HeaderMap::new();
+        with_header.insert(
+            "x-codex-secondary-reset-after-seconds",
+            HeaderValue::from_static("86400"),
+        );
+        assert_eq!(
+            hold(&with_header, r#"{"error":{"type":"usage_limit_reached"}}"#),
+            expect(86400, "header")
+        );
+    }
+
+    #[test]
+    fn parse_usage_report_reads_both_windows() {
+        // Primary carries a relative 2h, secondary an absolute 2100 reset:
+        // the later one wins regardless of which field shape it used.
+        let report = parse_usage_report(USAGE_EXHAUSTED.as_bytes(), 4_102_444_800 - 3600).unwrap();
+        assert!(report.exhausted);
+        assert_eq!(report.max_used_percent, 100.0);
+        assert_eq!(report.reset_in, Some(Duration::from_secs(7200)));
+        let report =
+            parse_usage_report(USAGE_EXHAUSTED.as_bytes(), 4_102_444_800 - 500_000).unwrap();
+        assert_eq!(report.reset_in, Some(Duration::from_secs(500_000)));
+
+        let report = parse_usage_report(USAGE_AVAILABLE.as_bytes(), 0).unwrap();
+        assert!(!report.exhausted);
+        assert_eq!(report.max_used_percent, 40.5);
+        assert_eq!(
+            report.reset_in, None,
+            "no window is blown, nothing to wait for"
+        );
+
+        // Weekly (secondary) blown while the 5h window has headroom — the
+        // case a primary-only check misses.
+        let weekly = br#"{"rate_limit":{"limit_reached":false,"primary_window":{"used_percent":12},"secondary_window":{"used_percent":100,"reset_at":1500000}}}"#;
+        let report = parse_usage_report(weekly, 1_000_000).unwrap();
+        assert!(report.exhausted);
+        assert_eq!(report.reset_in, Some(Duration::from_secs(500_000)));
+
+        // `limit_reached` alone is enough.
+        let flagged =
+            br#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99}}}"#;
+        assert!(parse_usage_report(flagged, 0).unwrap().exhausted);
+
+        // No rate_limit object at all: unreadable, not "available".
+        assert_eq!(parse_usage_report(br#"{"plan_type":"plus"}"#, 0), None);
+        assert_eq!(parse_usage_report(b"nope", 0), None);
     }
 
     async fn scripted_oauth() -> Response {
@@ -1000,6 +1943,52 @@ mod tests {
                 "status {status}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn quota_hold_only_ever_extends() {
+        // 429 with no parseable reset: hold = one poll interval (600s default).
+        let mut fake = start_scripted_upstream_with_429_body(
+            std::collections::HashMap::from([("acct-0", vec![429])]),
+            r#"{"error":{"type":"usage_limit_reached"}}"#,
+        )
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
+        let _ = upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .await
+            .unwrap();
+        let _ = fake.recv().await;
+        let remaining = |upstream: &Upstream| {
+            upstream.pool[0]
+                .quota_hold_remaining(Instant::now())
+                .expect("account should be under quota hold")
+        };
+        let initial = remaining(&upstream);
+        assert!(initial <= Duration::from_secs(600), "{initial:?}");
+
+        // Poll says still exhausted with a 2h reset: the hold grows past the
+        // defaulted 600s (without the re-mark it would lapse while the
+        // account is still exhausted).
+        fake.script_usage((200, r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100,"reset_after_seconds":7200}}}"#)).await;
+        upstream.poll_quota_once().await;
+        let extended = remaining(&upstream);
+        assert!(extended > Duration::from_secs(600), "{extended:?}");
+
+        // A later poll carrying a nearer reset must not shorten it.
+        fake.script_usage((200, r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100,"reset_after_seconds":60}}}"#)).await;
+        upstream.poll_quota_once().await;
+        let after = remaining(&upstream);
+        assert!(after > Duration::from_secs(7000), "{after:?}");
+    }
+
+    #[test]
+    fn synthetic_failure_reasons_have_stable_labels() {
+        // Set by the pool's own classification (`Upstream::unavailable`, or
+        // a quota 429 it just saw), not by `from_status`. Operators group
+        // failover lines on these.
+        assert_eq!(FailureReason::QuotaExhausted.as_str(), "quota_exhausted");
+        assert_eq!(FailureReason::CoolingDown.as_str(), "cooling_down");
     }
 
     #[test]

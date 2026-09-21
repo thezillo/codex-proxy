@@ -133,6 +133,11 @@ impl FallbackChain {
         Ok(Self { http, providers })
     }
 
+    /// No providers configured — the pre-fallback deployment shape.
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
     /// Try each configured provider in order against `body` — the same body
     /// the ChatGPT pool just failed on; each provider rewrites `"model"` for
     /// itself. Returns `None` when: the chain is empty, no provider has a
@@ -188,6 +193,7 @@ impl FallbackChain {
                         last = Some(ForwardedResponse {
                             response,
                             account: provider.name.clone(),
+                            reason: None,
                         });
                         continue;
                     }
@@ -195,6 +201,7 @@ impl FallbackChain {
                         ForwardedResponse {
                             response,
                             account: provider.name.clone(),
+                            reason: None,
                         },
                         model,
                     ));

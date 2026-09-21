@@ -161,6 +161,8 @@ refresh_skew_secs = 300         # refresh this long before the JWT `exp`
 request_timeout_secs = 600
 connect_timeout_secs = 30
 account_cooldown_secs = 30      # skip a failed pool account this long
+usage_path = "/wham/usage"      # ChatGPT usage endpoint the quota poller reads
+quota_check_interval_secs = 600 # re-check quota-exhausted accounts; 0 = off
 # [upstream.account_names]      # label pool accounts in logs, by dir basename
 
 [defaults]                      # applied when the client omits the field
@@ -262,7 +264,11 @@ pool failed, served by fallback provider  client=alice ip=1.2.3.4 request_id=...
 
 - `reason` is a normalized category, so it can be grouped on: `rate_limit`,
   `auth`, `timeout`, `capacity`, `upstream_5xx`, `bad_request`, `transport`,
-  `unknown`.
+  `quota_exhausted`, `cooling_down`, `unknown`. `quota_exhausted` is a
+  `usage_limit_reached` 429 — either the request that discovered it
+  (`status=429`) or one diverted straight to the chain afterwards because
+  every account is under such a hold (`status=0`); `cooling_down` is always
+  the diverted case (`status=0`). See Quota-aware fallback below.
 - `account`/`status` are the LAST pool account tried and the status it
   returned. `status=0` means it never returned one — `transport`/`timeout`,
   but also `auth`, which is the revoked-session case (our own token refresh
@@ -328,6 +334,30 @@ the next account in the pool. A failing account also cools down for
 `upstream.account_cooldown_secs` (default 30s) and gets skipped by
 round-robin until then. Check the `account` field in the access log to see
 which one served (or failed) a request.
+
+### Quota-aware fallback
+
+A 429 whose body says `usage_limit_reached` is not a throttle — it's the
+5-hour or weekly Codex quota, with a reset hours or days away. Such an
+account is marked *quota-exhausted* until the reset the 429 reports
+(separately from the 30s cooldown) and skipped by round-robin meanwhile.
+While any account is in that state the proxy polls the ChatGPT usage
+endpoint for it every `upstream.quota_check_interval_secs` (default 600) and
+puts it back in rotation as soon as the report shows headroom again — so a
+reset that lands early (manual reset, plan change) is picked up without
+waiting for the originally reported time. Both the 5h and the weekly window
+count; healthy accounts are never polled; `0` disables polling (the state
+then clears only when the reported reset passes). A poll that fails leaves
+the state as it is: the account comes back when its 429 said it would.
+
+When every account is quota-exhausted (or cooling down) and a `[[fallback]]`
+chain is configured, requests go straight to the chain without an upstream
+round-trip — the failover line then says `reason=quota_exhausted` (or
+`cooling_down`) with `status=0`; the request that discovered the exhaustion
+logs `reason=quota_exhausted status=429`. Without a chain the pool still tries an
+account, as before: a shaky account beats refusing the request. If the chain
+declines a request (no `model_map` entry for that model), the pool is tried
+anyway.
 
 ## Fallback providers
 

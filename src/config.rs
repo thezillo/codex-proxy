@@ -155,7 +155,31 @@ pub struct UpstreamConfig {
     /// that's still probably banned/rate-limited/broken, without any active
     /// health-checking. Only affects account *selection*; a request already
     /// mid-failover still tries every account regardless of cooldown state.
+    ///
+    /// When every account is cooling down (or quota-exhausted, see
+    /// `quota_check_interval_secs`), what happens depends on whether a
+    /// `[[fallback]]` chain exists: without one the pool still tries an
+    /// account — a shaky account beats refusing the request outright; with
+    /// one the request goes straight to the fallback chain without an
+    /// upstream round-trip, since a working fallback beats a request we just
+    /// saw fail.
     pub account_cooldown_secs: u64,
+    /// Path (appended to `base_url`) of the ChatGPT usage endpoint the
+    /// quota poller queries. Internal/undocumented, but the real Codex CLI
+    /// calls it too (for `/status`), so hitting it is not a fingerprint.
+    pub usage_path: String,
+    /// Quota-aware account state. A 429 whose body says
+    /// `usage_limit_reached` is not a transient throttle: it's a hard limit
+    /// with a known reset time (hours for the 5h window, days for the
+    /// weekly one). Such an account is marked quota-exhausted until that
+    /// reset — separately from the short `account_cooldown_secs` — and
+    /// skipped by selection meanwhile. While any account is in that state,
+    /// the poller re-reads `usage_path` for it every this many seconds and
+    /// clears the state as soon as the usage report says the quota is back,
+    /// which can happen before the originally reported reset (manual reset,
+    /// plan change). `0` disables polling: the state then only clears when
+    /// the reset time reported on the 429 passes.
+    pub quota_check_interval_secs: u64,
 }
 
 /// Coding-friendly request defaults, applied when the client omits a field.
@@ -247,6 +271,8 @@ impl Default for UpstreamConfig {
             connect_timeout_secs: 30,
             proxy: None,
             account_cooldown_secs: 30,
+            usage_path: "/wham/usage".to_string(),
+            quota_check_interval_secs: 600,
         }
     }
 }

@@ -83,8 +83,21 @@ connect_timeout_secs = 30
 # blocks your deploy region/IP. Leave unset for a direct connection.
 # proxy = "socks5://user:pass@host:1080"
 # How long (seconds) a pool account is skipped by round-robin after a
-# 401(post-retry)/403/429 — only matters with multiple accounts configured.
+# 401(post-retry)/403/429. With a [[fallback]] chain configured, a request
+# arriving while EVERY account is cooling down (or quota-exhausted, below)
+# goes straight to the chain instead of retrying a known-bad account; without
+# a chain the pool still tries one.
 account_cooldown_secs = 30
+# Quota-aware state: a 429 saying `usage_limit_reached` (the 5h/weekly Codex
+# quota, reset hours or days away) marks the account quota-exhausted until the
+# reset it reports, separately from the short cooldown above. While any
+# account is in that state the proxy re-reads `usage_path` for it every
+# `quota_check_interval_secs` and clears the state as soon as the report
+# shows headroom — an early/manual reset is picked up without waiting for the
+# originally reported time. Healthy accounts are never polled. 0 disables
+# polling (the state then clears only when the reported reset passes).
+usage_path = "/wham/usage"
+quota_check_interval_secs = 600
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]
