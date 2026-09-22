@@ -120,8 +120,6 @@ include_reasoning = false
 [defaults.model_aliases]
 "gpt-6" = "gpt-6-astra"
 "gpt-5.6" = "gpt-5.6-sol"
-"gpt-4o" = "gpt-6-astra"
-"gpt-4.1" = "gpt-6-astra"
 
 # Cost guardrails in front of the paid [[fallback]] chain.
 [models]
