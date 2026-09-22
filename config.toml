@@ -72,8 +72,8 @@ originator = "codex_cli_rs"
 # generated at runtime, and there is no `codex-proxy` suffix, so the UA can't
 # fingerprint the proxy. Bump to match the real Codex CLI, or override with
 # CODEXPROXY_CLI_VERSION. Keep it >= the highest `minimal_client_version` of
-# the models below (gpt-6-astra wants 0.153.0).
-cli_version = "0.153.4"
+# the models below (gpt-6-sol/gpt-6-luna want 0.155.0).
+cli_version = "0.155.1"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600

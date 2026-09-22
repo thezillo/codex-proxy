@@ -134,7 +134,7 @@ Anything settable by env is also settable in the file; the reverse isn't true.
 | `CODEXPROXY_API_KEYS` | `client_auth.keys` | `sk-local-changeme` placeholder |
 | `CODEXPROXY_DATA_DIR` | `upstream.data_dir` | `~/.codex` |
 | `CODEXPROXY_AUTH_JSON` | — (seed, not config) | unset |
-| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.153.4` |
+| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.155.1` |
 | `CODEXPROXY_PROXY` | `upstream.proxy` | unset (direct) |
 | `CODEXPROXY_LOG` | `logging.level` | `info` |
 | `CODEXPROXY_LOG_FORMAT` | `logging.format` | `text` |
@@ -218,8 +218,8 @@ in the logs, it's one of these three — the message names which.
 
 `/health` and the model endpoints need no auth (so they work as container
 probes); all `/v1` POST endpoints do. Advertised (and, by default, the only
-accepted) models: `gpt-6-astra`, `gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`,
-`gpt-5.6-luna`, `gpt-5.6`. Older generations such as `gpt-5.5` are refused
+accepted) models: `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6`,
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`. Older generations such as `gpt-5.5` are refused
 by the ChatGPT upstream and get a 400 here; see Cost guardrails.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
