@@ -340,8 +340,19 @@ is stored as `exported_endpoint` unless the ServiceMonitor sets
 No list to maintain — the pool is auto-discovered from `data_dir`. Drop each
 extra account's `auth.json` into its own subdirectory (its own
 `codex login --codex-home <subdir>`, or its own mounted secret) and restart;
-requests round-robin across whatever's found. Useful once one account's rate
+requests are spread across whatever's found. Useful once one account's rate
 limit isn't enough.
+
+Requests that carry a session identity — the real Codex CLI sends
+`session-id` (and `thread-id`) on every turn — are pinned to one "home"
+account, picked by a stable hash of that id. Every turn of a session then
+lands on the same account while it's healthy, so that account's prompt cache
+keeps serving the growing conversation instead of it being re-read from
+scratch on another account every other turn. Requests without those headers
+(plain OpenAI-style clients) round-robin. If the home account fails, the
+session moves to the next account in order and stays there until home is
+usable again. The hash is fixed (FNV-1a), so sessions keep their account
+across restarts; adding or removing an account does reshuffle them.
 
 A 401 triggers one forced token refresh and retry on the same account. If
 that still fails, or the account gets a 403 or 429, the request fails over to
