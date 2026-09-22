@@ -300,25 +300,50 @@ impl Upstream {
         }
     }
 
-    /// Pick the next pool account: round-robin from the cursor, taking the
-    /// most usable one by `Availability` (ready, else merely cooling, else
-    /// quota-held — when everything is unavailable, trying a shaky account
-    /// beats refusing the request outright; a caller with somewhere better
-    /// to send it checks `unavailable` first). `min_by_key` keeps the first
-    /// best in cursor order, so a healthy pool still rotates evenly.
+    /// Where a request starts looking in the pool. A request carrying a
+    /// session identity (see `affinity_key`) always starts at the same
+    /// account — its session's "home" — so every turn of one Codex session
+    /// lands on one account while it's healthy, and that account's prompt
+    /// cache keeps serving the growing conversation prefix. Anything else
+    /// round-robins from a shared cursor, as before. A single-account pool
+    /// has nothing to choose, so it skips both.
+    fn start_index(&self, client_headers: &reqwest::header::HeaderMap) -> usize {
+        let len = self.pool.len();
+        if len == 1 {
+            return 0;
+        }
+        match affinity_key(client_headers) {
+            Some(hash) => (hash % len as u64) as usize,
+            None => self.next.fetch_add(1, Ordering::Relaxed) % len,
+        }
+    }
+
+    /// Pick the next account to try, scanning the pool in order from
+    /// `start` and skipping any already `tried` this sweep: the most usable
+    /// one by `Availability` (ready, else merely cooling, else quota-held —
+    /// when everything is unavailable, trying a shaky account beats refusing
+    /// the request outright; a caller with somewhere better to send it
+    /// checks `unavailable` first). `min_by_key` keeps the first best in
+    /// scan order, so a healthy pool rotates evenly under round-robin and a
+    /// session stays on its home account under affinity. `None` once every
+    /// account has been tried.
+    ///
     /// Returns the pool index too, so a caller that later sees this account
     /// fail can start its cooldown. Returns owned handles for the rest (not
     /// a borrow of `self`) so the caller can `.await` on them freely.
-    fn next_account(&self) -> (usize, Arc<AuthManager>, Arc<str>) {
+    fn next_account(
+        &self,
+        start: usize,
+        tried: &[bool],
+    ) -> Option<(usize, Arc<AuthManager>, Arc<str>)> {
         let now = Instant::now();
         let len = self.pool.len();
-        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
         let idx = (0..len)
             .map(|offset| (start + offset) % len)
-            .min_by_key(|&i| self.pool[i].availability(now))
-            .expect("pool is never empty");
+            .filter(|&i| !tried[i])
+            .min_by_key(|&i| self.pool[i].availability(now))?;
         let entry = &self.pool[idx];
-        (idx, entry.auth.clone(), entry.label.clone())
+        Some((idx, entry.auth.clone(), entry.label.clone()))
     }
 
     /// `Some` when no account can serve a request right now — every one is
@@ -403,15 +428,10 @@ impl Upstream {
         let mut last_response = None;
         let mut last_err: Option<PoolFailure> = None;
 
-        for _ in 0..pool_len {
-            let (idx, auth_mgr, account) = self.next_account();
-            if tried[idx] {
-                // Cooldown-skipping wrapped back onto an account already
-                // tried this sweep (possible under concurrent traffic
-                // interleaving the shared round-robin cursor) — every
-                // distinct account has had its shot.
-                break;
-            }
+        // Chosen once per request: the sweep below walks the pool from here,
+        // each account at most once.
+        let start = self.start_index(client_headers);
+        while let Some((idx, auth_mgr, account)) = self.next_account(start, &tried) {
             tried[idx] = true;
 
             match self
@@ -766,6 +786,31 @@ impl Upstream {
             )
         })
     }
+}
+
+/// Client headers that identify one conversation, in order of preference —
+/// the real Codex CLI sends both on every turn (see
+/// `SESSION_IDENTITY_HEADERS`). `session-id` spans the whole session, so it
+/// comes first; `thread-id` alone still keeps one thread together.
+const AFFINITY_HEADERS: &[&str] = &["session-id", "thread-id"];
+
+/// Stable 64-bit hash of the request's session identity, or `None` when the
+/// client sent none (plain OpenAI-style clients) — those round-robin.
+/// FNV-1a rather than `std`'s hasher: the value picks an account, so it must
+/// not change across restarts or Rust versions, or every live session would
+/// move accounts (and lose its prompt cache) on each deploy.
+fn affinity_key(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = AFFINITY_HEADERS
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .map(|v| v.as_bytes())
+        .filter(|v| !v.is_empty())?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(hash)
 }
 
 /// Upstream statuses that mean "this account can't serve the request right
@@ -1204,6 +1249,158 @@ mod tests {
                 Some("acct-2".to_string()),
             ]
         );
+    }
+
+    fn session_headers(session: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", session.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn affinity_key_is_a_fixed_fnv1a_so_sessions_survive_restarts() {
+        // Pinned value: if this changes, every live session moves accounts
+        // (and loses its prompt cache) on the next deploy.
+        assert_eq!(
+            affinity_key(&session_headers("sess-abc")),
+            Some(0x7dcf_79c7_f6fa_627e)
+        );
+        // session-id wins over thread-id; thread-id alone still counts.
+        let mut both = session_headers("sess-abc");
+        both.insert("thread-id", "thread-x".parse().unwrap());
+        assert_eq!(
+            affinity_key(&both),
+            affinity_key(&session_headers("sess-abc"))
+        );
+        let mut thread_only = HeaderMap::new();
+        thread_only.insert("thread-id", "thread-x".parse().unwrap());
+        assert!(affinity_key(&thread_only).is_some());
+        assert_eq!(affinity_key(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_stays_on_its_home_account() {
+        let mut fake = start_fake_account_log(8).await;
+        let upstream = test_pool(&fake.base_url, 3).await;
+        // "sess-abc" hashes to index 1 of 3 (see the pinned value above).
+        for _ in 0..4 {
+            let fwd = upstream
+                .forward_responses(
+                    bytes::Bytes::from_static(b"{}"),
+                    &session_headers("sess-abc"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(&*fwd.account, "account-1");
+            assert_eq!(fake.recv().await.as_deref(), Some("acct-1"));
+        }
+        // Session-less traffic keeps round-robinning around it.
+        let mut served = Vec::new();
+        for _ in 0..3 {
+            let fwd = upstream
+                .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+                .await
+                .unwrap();
+            served.push(fwd.account.to_string());
+            let _ = fake.recv().await;
+        }
+        assert_eq!(served, ["account-0", "account-1", "account-2"]);
+    }
+
+    #[tokio::test]
+    async fn a_session_moves_to_the_next_account_while_home_is_cooling() {
+        // Home (acct-1) throttles once. The session fails over to the next
+        // account in scan order and STAYS there for the cooldown, instead of
+        // bouncing between accounts on every turn.
+        let mut fake = start_scripted_upstream(std::collections::HashMap::from([(
+            "acct-1",
+            vec![429, 200],
+        )]))
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 3, 30).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(b"{}"),
+                &session_headers("sess-abc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*fwd.account, "account-2");
+        assert_eq!(fake.recv().await, ("acct-1".to_string(), 429));
+        assert_eq!(fake.recv().await, ("acct-2".to_string(), 200));
+
+        for _ in 0..2 {
+            let fwd = upstream
+                .forward_responses(
+                    bytes::Bytes::from_static(b"{}"),
+                    &session_headers("sess-abc"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(&*fwd.account, "account-2");
+            assert_eq!(fake.recv().await, ("acct-2".to_string(), 200));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_returns_home_once_the_cooldown_is_over() {
+        let mut fake = start_scripted_upstream(std::collections::HashMap::from([(
+            "acct-1",
+            vec![429, 200],
+        )]))
+        .await;
+        // Cooldown 0: home is usable again immediately after its failure.
+        let upstream = test_pool_with_cooldown(&fake.base_url, 3, 0).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(b"{}"),
+                &session_headers("sess-abc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*fwd.account, "account-2");
+        let _ = fake.recv().await;
+        let _ = fake.recv().await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(b"{}"),
+                &session_headers("sess-abc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*fwd.account, "account-1");
+        assert_eq!(fake.recv().await, ("acct-1".to_string(), 200));
+    }
+
+    #[tokio::test]
+    async fn every_account_is_tried_once_even_with_no_cooldown() {
+        // With cooldown 0 a failed account stays "ready", so selection used
+        // to be able to land on it again and end the sweep early. Tried
+        // accounts are now excluded outright.
+        let mut fake = start_scripted_upstream(std::collections::HashMap::from([
+            ("acct-0", vec![429]),
+            ("acct-1", vec![429]),
+            ("acct-2", vec![429]),
+        ]))
+        .await;
+        let upstream = test_pool_with_cooldown(&fake.base_url, 3, 0).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(b"{}"),
+                &session_headers("sess-abc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fwd.response.status(), 429);
+        let mut hit: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            hit.push(fake.recv().await.0);
+        }
+        assert_eq!(hit, ["acct-1", "acct-2", "acct-0"]);
     }
 
     struct FakeHeaderEcho {
