@@ -409,10 +409,13 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Models this proxy advertises, most capable first (the order is
-/// client-visible — pickers render it as given). The Codex upstream serves the
-/// flavored slugs (gpt-6-astra, and the 5.6 sol/terra/luna trio) plus gpt-5.5
-/// over a ChatGPT account; the bare "gpt-6"/"gpt-5.6" names are listed for
+/// Models this proxy advertises AND accepts (see `[models] reject_unknown`),
+/// most capable first (the order is client-visible — pickers render it as
+/// given). Current generations only: the ChatGPT-account upstream has dropped
+/// older ones (gpt-5.5 and gpt-5.4 answer 400 "not supported"), so listing
+/// them would only route their traffic onto the paid fallback. The Codex
+/// upstream serves the flavored slugs (gpt-6-astra, and the 5.6
+/// sol/terra/luna trio) over a ChatGPT account; the bare "gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
 /// model aliases — on both POST endpoints, so a client that picks a bare name
 /// out of this very list reaches the subscription pool whichever wire API it
@@ -425,7 +428,6 @@ const SUPPORTED_MODELS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.6",
-    "gpt-5.5",
 ];
 
 /// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
@@ -1039,7 +1041,7 @@ mod tests {
         // otherwise arbitrary `model` strings would mint unbounded Prometheus
         // time series (see codexproxy_requests_total{model=...}).
         assert_eq!(super::metric_model_label("gpt-6-astra"), "gpt-6-astra");
-        assert_eq!(super::metric_model_label("gpt-5.5"), "gpt-5.5");
+        assert_eq!(super::metric_model_label("gpt-5.6-luna"), "gpt-5.6-luna");
         assert_eq!(
             super::metric_model_label("literally-anything-a-client-sends"),
             "other"
@@ -1523,9 +1525,12 @@ mod tests {
             responses_path: "/responses".to_string(),
             auth_style: "bearer".to_string(),
             api_key: "fallback-key".to_string(),
-            model_map: [("gpt-5.5".to_string(), "gpt-5.5-on-fallback".to_string())]
-                .into_iter()
-                .collect(),
+            model_map: [(
+                "gpt-5.6-luna".to_string(),
+                "gpt-5.6-luna-on-fallback".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -1647,7 +1652,9 @@ mod tests {
         );
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1718,7 +1725,9 @@ mod tests {
         );
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1729,11 +1738,11 @@ mod tests {
 
         let pool_req = pool.recv().await;
         let pool_body: serde_json::Value = serde_json::from_slice(&pool_req.body).unwrap();
-        assert_eq!(pool_body["model"], "gpt-5.5");
+        assert_eq!(pool_body["model"], "gpt-5.6-luna");
 
         let fallback_req = fallback_fake.recv().await;
         let fallback_body: serde_json::Value = serde_json::from_slice(&fallback_req.body).unwrap();
-        assert_eq!(fallback_body["model"], "gpt-5.5-on-fallback");
+        assert_eq!(fallback_body["model"], "gpt-5.6-luna-on-fallback");
     }
 
     #[tokio::test]
@@ -1761,7 +1770,9 @@ mod tests {
         // serves. This is the pre-existing failover path.
         let response = app
             .clone()
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1774,7 +1785,9 @@ mod tests {
         // Second request: the pool is known-exhausted, so it must not be
         // touched at all — straight to the fallback provider.
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"again"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"again"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1817,7 +1830,9 @@ mod tests {
         for _ in 0..2 {
             let response = app
                 .clone()
-                .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+                .oneshot(responses_request(
+                    r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
@@ -1845,7 +1860,9 @@ mod tests {
         for _ in 0..2 {
             let response = app
                 .clone()
-                .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+                .oneshot(responses_request(
+                    r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1862,7 +1879,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_exhausted_pool_is_still_tried_when_the_chain_declines_the_model() {
-        // The chain only maps gpt-5.5. A request for another model finds no
+        // The chain only maps gpt-5.6-luna. A request for another model finds no
         // provider, so the skipped pool must get its normal shot instead of
         // the client seeing a synthetic error with zero upstream attempts.
         let mut pool = start_fake_upstream(
@@ -1886,7 +1903,9 @@ mod tests {
         // Put the pool into quota-exhausted state.
         let response = app
             .clone()
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1933,7 +1952,9 @@ mod tests {
         );
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1961,7 +1982,9 @@ mod tests {
         let app = test_router_with_fallback(pool.base_url.clone(), vec![cfg]);
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1988,7 +2011,9 @@ mod tests {
         let app = test_router_with_fallback(pool.base_url.clone(), vec![]);
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -2015,7 +2040,9 @@ mod tests {
         );
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2063,7 +2090,9 @@ mod tests {
         let metrics_app = metrics_router(metrics);
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2193,7 +2222,7 @@ mod tests {
                     .header("Content-Type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model": "gpt-5.5",
+                            "model": "gpt-5.6-luna",
                             "messages": [{ "role": "user", "content": "hi" }],
                             "stream": false
                         })
@@ -2218,7 +2247,9 @@ mod tests {
         let app = test_router_with_upstream(200, fake.base_url.clone());
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
 
@@ -2247,7 +2278,7 @@ mod tests {
                     .header("Content-Type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model": "gpt-5.5",
+                            "model": "gpt-5.6-luna",
                             "messages": [{ "role": "user", "content": "hi" }],
                             "stream": false
                         })
@@ -2527,11 +2558,12 @@ mod tests {
 
     #[tokio::test]
     async fn pool_400_is_relayed_instead_of_paying_the_fallback() {
-        const REFUSED: &str = r#"{"detail":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}"#;
+        const REFUSED: &str = r#"{"detail":"The 'gpt-5.6-luna' model is not supported when using Codex with a ChatGPT account."}"#;
         let pool =
-            start_model_aware_upstream(vec![("gpt-5.5", StatusCode::BAD_REQUEST, REFUSED)]).await;
+            start_model_aware_upstream(vec![("gpt-5.6-luna", StatusCode::BAD_REQUEST, REFUSED)])
+                .await;
         let fallback = start_model_aware_upstream(vec![(
-            "gpt-5.5-on-fallback",
+            "gpt-5.6-luna-on-fallback",
             StatusCode::OK,
             r#"{"ok":"fb"}"#,
         )])
@@ -2539,7 +2571,9 @@ mod tests {
         let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2553,9 +2587,9 @@ mod tests {
     #[tokio::test]
     async fn pool_400_still_falls_back_when_explicitly_allowed() {
         let pool =
-            start_model_aware_upstream(vec![("gpt-5.5", StatusCode::BAD_REQUEST, "{}")]).await;
+            start_model_aware_upstream(vec![("gpt-5.6-luna", StatusCode::BAD_REQUEST, "{}")]).await;
         let fallback = start_model_aware_upstream(vec![(
-            "gpt-5.5-on-fallback",
+            "gpt-5.6-luna-on-fallback",
             StatusCode::OK,
             r#"{"ok":"fb"}"#,
         )])
@@ -2565,11 +2599,13 @@ mod tests {
         let (app, _) = guarded_router(config);
 
         let response = app
-            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(fallback.seen(), ["gpt-5.5-on-fallback"]);
+        assert_eq!(fallback.seen(), ["gpt-5.6-luna-on-fallback"]);
     }
 
     #[tokio::test]
@@ -2616,6 +2652,33 @@ mod tests {
             scraped.contains(r#"reason="unknown_model"} 2"#),
             "{scraped}"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_generations_are_refused_not_billed() {
+        // gpt-5.5 is what ran on OpenRouter for weeks: the pool 400s it and
+        // the paid chain carried it. It is no longer an accepted model.
+        let pool = start_model_aware_upstream(vec![]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+        for model in ["gpt-5.5", "gpt-5.4", "gpt-4o"] {
+            let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("Authorization", "Bearer test-key")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+        }
+        assert!(pool.seen().is_empty() && fallback.seen().is_empty());
     }
 
     #[tokio::test]
