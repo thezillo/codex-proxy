@@ -63,3 +63,80 @@ pub(crate) fn unique_temp_dir() -> PathBuf {
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+/// OpenAI's `invalid_encrypted_content` 400 body (openai/codex#17541).
+pub(crate) const INVALID_ENCRYPTED_400_BODY: &str = r#"{"error":{"message":"The encrypted content gAAA...= could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
+
+/// A Responses body replaying a reasoning item minted by some other
+/// upstream, between a user message and a tool call/output pair.
+pub(crate) const FOREIGN_REPLAY_BODY: &str = r#"{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":"hi"},{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"gAAA-foreign"},{"type":"function_call","call_id":"c1","name":"sh","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}]}"#;
+
+/// One request a `ReplayRejectingUpstream` received.
+pub(crate) struct ReplayRequest {
+    pub headers: axum::http::HeaderMap,
+    pub body: serde_json::Value,
+}
+
+/// Fake upstream that, like a real one handed another upstream's encrypted
+/// state, answers `INVALID_ENCRYPTED_400_BODY` to any body replaying an
+/// `encrypted_content` — or to every body, with `always_reject` — and 200
+/// otherwise. Serves `path`, and records every request in order.
+pub(crate) struct ReplayRejectingUpstream {
+    pub base_url: String,
+    pub rx: tokio::sync::mpsc::Receiver<ReplayRequest>,
+}
+
+pub(crate) async fn start_replay_rejecting_upstream(
+    path: &str,
+    always_reject: bool,
+) -> ReplayRejectingUpstream {
+    use axum::extract::State;
+    use axum::response::Response;
+
+    type Tx = tokio::sync::mpsc::Sender<ReplayRequest>;
+    async fn handle(
+        State((tx, always_reject)): State<(Tx, bool)>,
+        headers: axum::http::HeaderMap,
+        body: bytes::Bytes,
+    ) -> Response {
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let replays_encrypted = body["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|i| i.get("encrypted_content").is_some()));
+        tx.send(ReplayRequest { headers, body }).await.unwrap();
+        let (status, reply) = if always_reject || replays_encrypted {
+            (400, INVALID_ENCRYPTED_400_BODY)
+        } else {
+            (200, r#"{"ok":true}"#)
+        };
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(reply))
+            .unwrap()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let app = axum::Router::new()
+        .route(path, axum::routing::post(handle))
+        .with_state((tx, always_reject));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ReplayRejectingUpstream {
+        base_url: format!("http://{addr}"),
+        rx,
+    }
+}
+
+/// The `type` of every input item, in order.
+pub(crate) fn input_types(body: &serde_json::Value) -> Vec<&str> {
+    body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].as_str().unwrap())
+        .collect()
+}

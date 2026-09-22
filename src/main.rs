@@ -10,6 +10,7 @@ mod error;
 mod fallback;
 mod metrics;
 mod observe;
+mod replay;
 mod server;
 #[cfg(test)]
 mod test_support;
