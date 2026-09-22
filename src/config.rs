@@ -50,6 +50,15 @@ pub struct FallbackProviderConfig {
     /// provider's own model/deployment string. A model absent from this map
     /// means this provider is skipped for that request — never guessed.
     pub model_map: HashMap<String, String>,
+    /// Send the request's conversation key as `session_id` and
+    /// `prompt_cache_key` (each only when the client didn't set it) — the
+    /// fields OpenRouter keeps provider stickiness on, so every turn of a
+    /// conversation reaches the provider already holding its prompt cache.
+    /// Off by default: a provider that validates its request schema strictly
+    /// (Azure OpenAI) may reject the unknown `session_id` field. Turn it on
+    /// for OpenRouter.
+    #[serde(default)]
+    pub sticky_session: bool,
 }
 
 fn default_fallback_responses_path() -> String {

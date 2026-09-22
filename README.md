@@ -308,7 +308,11 @@ elsewhere (and firewall it — it's unauthenticated). `metrics_port = 0`
 disables the metrics server without disabling collection.
 
 - `codexproxy_requests_total{endpoint, client, account, model, status}`
-- `codexproxy_tokens_total{client, account, model, kind}` — `kind` is `prompt` or `completion`
+- `codexproxy_tokens_total{client, account, model, kind}` — `kind` is `prompt`,
+  `completion`, `cached` (prompt tokens read from the provider's prompt cache,
+  a subset of `prompt`) or `cache_write` (written to it; OpenRouter reports
+  this and bills it at a premium for GPT-5.6+, so a high `cache_write` with a
+  low `cached` means paying extra for a cache that never gets read)
 - `codexproxy_request_duration_seconds{endpoint, client, account, model}`
 - `codexproxy_failovers_total{client, model, reason, fallback}` — one per
   request a paid fallback served; `reason` is the same closed set as the
@@ -343,16 +347,32 @@ extra account's `auth.json` into its own subdirectory (its own
 requests are spread across whatever's found. Useful once one account's rate
 limit isn't enough.
 
-Requests that carry a session identity — the real Codex CLI sends
-`session-id` (and `thread-id`) on every turn — are pinned to one "home"
-account, picked by a stable hash of that id. Every turn of a session then
-lands on the same account while it's healthy, so that account's prompt cache
-keeps serving the growing conversation instead of it being re-read from
-scratch on another account every other turn. Requests without those headers
-(plain OpenAI-style clients) round-robin. If the home account fails, the
-session moves to the next account in order and stays there until home is
-usable again. The hash is fixed (FNV-1a), so sessions keep their account
-across restarts; adding or removing an account does reshuffle them.
+Every request is pinned to one "home" account per conversation, so all
+turns of a conversation land on the same account while it's healthy and that
+account's prompt cache keeps serving the growing history, instead of it being
+re-read from scratch on another account every other turn. The conversation
+key is, in order of preference:
+
+1. the `session-id` (else `thread-id`) header — the real Codex CLI sends both
+   on every turn;
+2. `prompt_cache_key` in the request body;
+3. a hash of the request's prefix: `instructions`, `tools` and the first
+   `input` item. Every turn resends the history and appends to it, so this
+   prefix is the same for all turns of a conversation and differs between
+   conversations. No similarity matching is involved or needed: prompt
+   caching only hits on an exact prefix anyway.
+
+Only requests with none of these (e.g. an empty body) round-robin. If the
+home account fails, the conversation moves to the next account in order and
+stays there until home is usable again. The hash is fixed (FNV-1a), so
+conversations keep their account across restarts; adding or removing an
+account does reshuffle them. A Codex history compaction rewrites the prefix,
+so a derived key changes once at that point. The access log's `affinity`
+field says which of the three the key came from.
+
+On `/v1/chat/completions`, where the proxy builds the upstream body itself,
+the key is also sent upstream as `prompt_cache_key` (a client's own value is
+kept). `/v1/responses` bodies are forwarded unchanged.
 
 A 401 triggers one forced token refresh and retry on the same account. If
 that still fails, or the account gets a 403 or 429, the request fails over to
@@ -432,6 +452,14 @@ declared provider ends up with an empty key.
 
 Fallback requests never carry Codex/ChatGPT-specific headers, and reuse the
 `upstream.proxy` setting if one's configured.
+
+`sticky_session = true` on a provider adds the request's conversation key
+(see Multiple ChatGPT accounts) to the body as `session_id` and
+`prompt_cache_key`, unless the client already set them. OpenRouter keeps
+provider stickiness on exactly these fields, so every turn of a conversation
+reaches the provider that already holds its prompt cache. Enable it for
+OpenRouter; leave it off for Azure OpenAI, which may reject the unknown
+`session_id` field.
 
 Every request that actually switches to a fallback provider logs why the
 pool refused it (`reason=`, see Logging above) — otherwise "served by

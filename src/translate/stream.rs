@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::config::DefaultsConfig;
 use crate::error::ProxyError;
+use crate::metrics::TokenUsage;
 use crate::observe::CompletionLog;
 
 fn now_secs() -> i64 {
@@ -210,26 +211,34 @@ fn push_tool_call(tool_calls: &mut Vec<Value>, call_id: &str, name: &str, args: 
     }));
 }
 
-/// Pull `(input_tokens, output_tokens)` out of a `response.completed` event,
-/// or `None` when the upstream omitted the usage block. Shared by the wire
-/// translation (`usage_from_completed`) and the access-log token attribution so
-/// both read the same numbers.
-pub fn usage_tokens(evt: &Value) -> Option<(i64, i64)> {
+/// Pull token usage out of a `response.completed` event, or `None` when the
+/// upstream omitted the usage block. Shared by the wire translation
+/// (`usage_from_completed`) and the access-log token attribution so both read
+/// the same numbers. Cache counts come from `input_tokens_details`:
+/// `cached_tokens` is OpenAI's (and every provider's) cache read;
+/// `cache_write_tokens` is OpenRouter's, absent elsewhere.
+pub fn usage_tokens(evt: &Value) -> Option<TokenUsage> {
     let u = evt.pointer("/response/usage")?;
-    let input = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let output = u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-    Some((input, output))
+    let count = |v: Option<&Value>| v.and_then(Value::as_i64).unwrap_or(0);
+    let details = u.get("input_tokens_details");
+    Some(TokenUsage {
+        prompt: count(u.get("input_tokens")),
+        completion: count(u.get("output_tokens")),
+        cached: count(details.and_then(|d| d.get("cached_tokens"))),
+        cache_write: count(details.and_then(|d| d.get("cache_write_tokens"))),
+    })
 }
 
 fn usage_from_completed(evt: &Value) -> Value {
-    let (input, output) = usage_tokens(evt).unwrap_or_else(|| {
+    let usage = usage_tokens(evt).unwrap_or_else(|| {
         tracing::warn!("response.completed without usage block; reporting zero tokens");
-        (0, 0)
+        TokenUsage::default()
     });
     json!({
-        "prompt_tokens": input,
-        "completion_tokens": output,
-        "total_tokens": input + output,
+        "prompt_tokens": usage.prompt,
+        "completion_tokens": usage.completion,
+        "total_tokens": usage.prompt + usage.completion,
+        "prompt_tokens_details": { "cached_tokens": usage.cached },
     })
 }
 
@@ -257,7 +266,7 @@ pub fn stream_chat(
     let include_reasoning = defaults.include_reasoning;
 
     try_stream! {
-        let mut final_usage: Option<(i64, i64)> = None;
+        let mut final_usage: Option<TokenUsage> = None;
         // Opening role chunk.
         yield sse(json!({
             "id": id,
@@ -523,7 +532,7 @@ pub fn tee_responses(
 /// rather than buffering without limit.
 struct SseUsageScanner {
     buf: Vec<u8>,
-    usage: Option<(i64, i64)>,
+    usage: Option<TokenUsage>,
     max_buf_bytes: usize,
     gave_up: bool,
 }
@@ -630,9 +639,12 @@ mod tests {
         let split = full.len() / 2;
         let mut s = SseUsageScanner::new(1024 * 1024);
         s.push(&full.as_bytes()[..split]);
-        assert_eq!(s.usage, None, "usage should not resolve from a partial event");
+        assert_eq!(
+            s.usage, None,
+            "usage should not resolve from a partial event"
+        );
         s.push(&full.as_bytes()[split..]);
-        assert_eq!(s.usage, Some((7, 3)));
+        assert_eq!(s.usage, Some(TokenUsage::new(7, 3)));
     }
 
     #[test]

@@ -185,8 +185,12 @@ format = "text"
 # base_url = "https://openrouter.ai/api/v1"
 # auth_style = "bearer"           # sends `Authorization: Bearer <api_key>`
 # api_key = "sk-or-..."           # or CODEXPROXY_FALLBACK_OPENROUTER_API_KEY
+# # Send the conversation key as session_id + prompt_cache_key, so OpenRouter
+# # keeps every turn on the provider holding its prompt cache. Leave off for
+# # Azure, which may reject the unknown session_id field.
+# sticky_session = true
 # [fallback.model_map]
-# "gpt-5.5" = "openai/gpt-4.1"
+# "gpt-6-astra" = "openai/gpt-6-astra"
 
 # --- Embeddings -----------------------------------------------------------
 # The ChatGPT subscription backend has no embeddings API, so POST

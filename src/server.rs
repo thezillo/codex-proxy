@@ -18,11 +18,12 @@ use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::affinity::{self, ConversationKey};
 use crate::config::{ClientKey, Config};
 use crate::embeddings::EmbeddingsUpstream;
 use crate::error::ProxyError;
 use crate::fallback::FallbackChain;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, TokenUsage};
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
     alias_responses_model, build_codex_request, collect_chat, model_of, rewrite_model, stream_chat,
@@ -73,9 +74,13 @@ impl AppState {
         body: bytes::Bytes,
         client_headers: &HeaderMap,
         ctx: &AccessCtx,
-        // `None` on `/v1/responses`, which never parses its own body.
+        // `None` when the body carried no string model.
         model: Option<&str>,
+        // Which conversation this is (see `crate::affinity`): picks the pool
+        // account, and rides along to fallback providers that want it.
+        key: Option<&ConversationKey>,
     ) -> Result<ForwardedResponse, ProxyError> {
+        let affinity = key.map(|k| k.hash);
         // Quota-aware short-circuit: when every pool account is known to be
         // unusable right now (quota-exhausted, or cooling down after a
         // failure) and there is somewhere else to send the request, don't
@@ -96,7 +101,7 @@ impl AppState {
             Some(failure) => Err(failure),
             None => match self
                 .upstream
-                .forward_responses(body.clone(), client_headers)
+                .forward_responses(body.clone(), client_headers, affinity)
                 .await
             {
                 Ok(fwd) if fwd.response.status().is_success() => return Ok(fwd),
@@ -134,12 +139,15 @@ impl AppState {
         // Throttled on this model? Try a lower one on the SAME pool before
         // paying anyone.
         if downgrade_eligible(&pool_result) {
-            if let Some(fwd) = self.try_downgrades(&body, client_headers, ctx).await {
+            if let Some(fwd) = self
+                .try_downgrades(&body, client_headers, ctx, affinity)
+                .await
+            {
                 return Ok(fwd);
             }
         }
 
-        match self.fallback.run(body.clone()).await {
+        match self.fallback.run(body.clone(), key).await {
             Some((fallback_fwd, dispatched_model)) => {
                 // Status and error are mutually exclusive: a status exists iff
                 // the pool got a response back, an error iff it didn't.
@@ -189,7 +197,7 @@ impl AppState {
                 // The chain declined and the pool was never tried: give the
                 // pool its normal chance, unavailable or not.
                 self.upstream
-                    .forward_responses(body, client_headers)
+                    .forward_responses(body, client_headers, affinity)
                     .await
                     .map_err(ProxyError::from)
             }
@@ -216,6 +224,7 @@ impl AppState {
         body: &bytes::Bytes,
         client_headers: &HeaderMap,
         ctx: &AccessCtx,
+        affinity: Option<u64>,
     ) -> Option<ForwardedResponse> {
         let downgrades = &self.config.models.downgrades;
         if downgrades.is_empty() {
@@ -233,7 +242,7 @@ impl AppState {
             let lowered = rewrite_model(body, &original, next)?;
             let result = self
                 .upstream
-                .forward_responses(lowered.into(), client_headers)
+                .forward_responses(lowered.into(), client_headers, affinity)
                 .await;
             let served = matches!(&result, Ok(fwd) if fwd.response.status().is_success());
             self.metrics.record_downgrade(
@@ -502,17 +511,20 @@ async fn responses(
         Some(rewritten) => bytes::Bytes::from(rewritten),
         None => body,
     };
-    // A second scan of the body (the alias check did one): a field-only
-    // deserialize, no tree built. `None` (not JSON, no string model) is left
-    // for the upstream to judge, as before.
-    let model = model_of(&body);
-    if let Some(m) = &model {
+    // A second scan of the body (the alias check did one), borrowing the big
+    // fields as raw JSON rather than building a tree: the model, plus what
+    // the conversation key is made of. A model of `None` (not JSON, no string
+    // model) is left for the upstream to judge, as before. The body itself
+    // is still forwarded byte-for-byte to the pool.
+    let info = affinity::inspect(&body);
+    if let Some(m) = &info.model {
         if let Some(rejection) = reject_unknown_model(&state, &ctx, m) {
             return Ok(rejection);
         }
     }
+    let key = affinity::resolve(&headers, info.key);
     let fwd = state
-        .forward_with_fallback(body, &headers, &ctx, model.as_deref())
+        .forward_with_fallback(body, &headers, &ctx, info.model.as_deref(), key.as_ref())
         .await?;
     let upstream = fwd.response;
 
@@ -526,6 +538,9 @@ async fn responses(
     // here (the body may be many MB); `-` marks "raw passthrough".
     let mut log = CompletionLog::new(ctx, "/v1/responses", "-", "-", state.metrics.clone());
     log.set_account(fwd.account);
+    if let Some(key) = &key {
+        log.set_affinity(key.source.as_str());
+    }
     let stream = tee_responses(upstream, log, state.config.server.max_body_bytes);
 
     let mut response = Response::builder()
@@ -587,11 +602,34 @@ async fn chat_completions(
             return Ok(rejection);
         }
     }
-    let bytes = serde_json::to_vec(&codex_body)
+    // The proxy builds this body itself, so it can also carry the
+    // conversation key upstream as `prompt_cache_key` — the field OpenAI
+    // (and, on the fallback, OpenRouter) route cache lookups by. The client's
+    // own `prompt_cache_key` was already copied in by `build_codex_request`
+    // and wins; a session header comes next; otherwise the key is derived
+    // from the body's prefix. Chat bodies are small, so serializing twice
+    // when a key has to be added is fine.
+    let mut codex_body = codex_body;
+    let mut bytes = serde_json::to_vec(&codex_body)
         .map_err(|e| ProxyError::Internal(format!("serialize codex request: {e}")))?;
+    let key = affinity::resolve(&headers, affinity::inspect(&bytes).key);
+    if let Some(key) = &key {
+        log.set_affinity(key.source.as_str());
+        if codex_body.get("prompt_cache_key").is_none() {
+            codex_body["prompt_cache_key"] = serde_json::Value::String(key.value.clone());
+            bytes = serde_json::to_vec(&codex_body)
+                .map_err(|e| ProxyError::Internal(format!("serialize codex request: {e}")))?;
+        }
+    }
 
     let fwd = state
-        .forward_with_fallback(bytes.into(), &headers, log.ctx(), Some(&echo_model))
+        .forward_with_fallback(
+            bytes.into(),
+            &headers,
+            log.ctx(),
+            Some(&echo_model),
+            key.as_ref(),
+        )
         .await?;
     log.set_account(fwd.account);
     let upstream = fwd.response;
@@ -625,14 +663,22 @@ async fn chat_completions(
     }
 }
 
-/// Pull `(prompt_tokens, completion_tokens)` from a buffered chat.completion
-/// body for the access log, or `None` if the usage block is missing.
-fn usage_pair(chat: &serde_json::Value) -> Option<(i64, i64)> {
+/// Token usage from a buffered chat.completion body for the access log, or
+/// `None` if the usage block is missing. `collect_chat` builds that block
+/// from the upstream's own counts (see `usage_tokens`), cache reads included;
+/// cache writes aren't part of the chat shape and are only counted on the
+/// streaming paths.
+fn usage_pair(chat: &serde_json::Value) -> Option<TokenUsage> {
     let usage = chat.get("usage")?;
-    Some((
-        usage.get("prompt_tokens").and_then(|v| v.as_i64())?,
-        usage.get("completion_tokens").and_then(|v| v.as_i64())?,
-    ))
+    Some(TokenUsage {
+        prompt: usage.get("prompt_tokens").and_then(|v| v.as_i64())?,
+        completion: usage.get("completion_tokens").and_then(|v| v.as_i64())?,
+        cached: usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        cache_write: 0,
+    })
 }
 
 /// `POST /v1/embeddings` — direct to the configured provider, no pool, no
@@ -708,7 +754,7 @@ async fn embeddings(
     // Echo the id the client asked for, as chat does with `echo_model` — the
     // provider's namespaced id (`openai/...`) is an implementation detail.
     json["model"] = serde_json::Value::String(requested);
-    log.emit(status, prompt_tokens.map(|p| (p, 0)));
+    log.emit(status, prompt_tokens.map(|p| TokenUsage::new(p, 0)));
     Ok(Json(json).into_response())
 }
 
@@ -1531,6 +1577,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            sticky_session: false,
         }
     }
 
@@ -2348,11 +2395,16 @@ mod tests {
     struct ModelAwareUpstream {
         base_url: String,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     impl ModelAwareUpstream {
         fn seen(&self) -> Vec<String> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn bodies(&self) -> Vec<serde_json::Value> {
+            self.bodies.lock().unwrap().clone()
         }
     }
 
@@ -2360,16 +2412,20 @@ mod tests {
         replies: Vec<(&'static str, StatusCode, &'static str)>,
     ) -> ModelAwareUpstream {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let replies = Arc::new(replies);
         let handler = {
             let seen = seen.clone();
+            let bodies = bodies.clone();
             move |body: Bytes| {
                 let seen = seen.clone();
+                let bodies = bodies.clone();
                 let replies = replies.clone();
                 async move {
                     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
                     let model = parsed["model"].as_str().unwrap_or("").to_string();
                     seen.lock().unwrap().push(model.clone());
+                    bodies.lock().unwrap().push(parsed);
                     let (status, reply) = replies
                         .iter()
                         .find(|(m, _, _)| *m == model)
@@ -2394,6 +2450,7 @@ mod tests {
         ModelAwareUpstream {
             base_url: format!("http://{addr}"),
             seen,
+            bodies,
         }
     }
 
@@ -2719,5 +2776,169 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(pool.seen(), ["gpt-5.2-codex"]);
+    }
+
+    // ---- conversation affinity: prompt_cache_key, sticky fallback, cache metrics ----
+
+    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}}}}\n\n";
+
+    fn chat_request(messages: serde_json::Value, extra: serde_json::Value) -> HttpRequest<Body> {
+        let mut body = json!({"model": "gpt-6-astra", "messages": messages, "stream": true});
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+            obj.extend(more.clone());
+        }
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Authorization", "Bearer test-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_turns_of_one_conversation_carry_one_derived_prompt_cache_key() {
+        let pool =
+            start_model_aware_upstream(vec![("gpt-6-astra", StatusCode::OK, COMPLETED_SSE)]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let turn1 =
+            json!([{"role": "system", "content": "sys"}, {"role": "user", "content": "task A"}]);
+        let turn2 = json!([{"role": "system", "content": "sys"}, {"role": "user", "content": "task A"},
+                           {"role": "assistant", "content": "ok"}, {"role": "user", "content": "more"}]);
+        let other =
+            json!([{"role": "system", "content": "sys"}, {"role": "user", "content": "task B"}]);
+        for messages in [turn1, turn2, other] {
+            let response = app
+                .clone()
+                .oneshot(chat_request(messages, json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = body_string(response).await;
+        }
+        let keys: Vec<String> = pool
+            .bodies()
+            .iter()
+            .map(|b| b["prompt_cache_key"].as_str().unwrap().to_string())
+            .collect();
+        assert!(keys[0].starts_with("cp-"), "{keys:?}");
+        assert_eq!(keys[0], keys[1], "turns of one conversation share a key");
+        assert_ne!(keys[0], keys[2], "different conversations don't");
+    }
+
+    #[tokio::test]
+    async fn a_client_prompt_cache_key_reaches_the_pool_unchanged() {
+        let pool =
+            start_model_aware_upstream(vec![("gpt-6-astra", StatusCode::OK, COMPLETED_SSE)]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(chat_request(
+                json!([{"role": "user", "content": "hi"}]),
+                json!({"prompt_cache_key": "client-key"}),
+            ))
+            .await
+            .unwrap();
+        let _ = body_string(response).await;
+        assert_eq!(pool.bodies()[0]["prompt_cache_key"], "client-key");
+    }
+
+    #[tokio::test]
+    async fn a_sticky_fallback_gets_the_conversation_key_as_session_id() {
+        let pool = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna",
+            StatusCode::TOO_MANY_REQUESTS,
+            THROTTLE_429,
+        )])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let mut config = guarded_config(&pool.base_url, &fallback.base_url, 30);
+        config.fallback[0].sticky_session = true;
+        let (app, _) = guarded_router(config);
+
+        // Header key: forwarded verbatim as both fields.
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("Authorization", "Bearer test-key")
+            .header("Content-Type", "application/json")
+            .header("session-id", "sess-abc")
+            .body(Body::from(r#"{"model":"gpt-5.6-luna","input":"hi"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // A client's own session_id is never overwritten.
+        let response = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","session_id":"mine","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bodies = fallback.bodies();
+        assert_eq!(bodies[0]["session_id"], "sess-abc");
+        assert_eq!(bodies[0]["prompt_cache_key"], "sess-abc");
+        assert_eq!(bodies[1]["session_id"], "mine");
+        assert!(bodies[1]["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("cp-"));
+    }
+
+    #[tokio::test]
+    async fn a_non_sticky_fallback_body_gets_no_session_fields() {
+        let pool = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna",
+            StatusCode::TOO_MANY_REQUESTS,
+            THROTTLE_429,
+        )])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = &fallback.bodies()[0];
+        assert!(body.get("session_id").is_none() && body.get("prompt_cache_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_and_cache_write_tokens_are_counted() {
+        let pool =
+            start_model_aware_upstream(vec![("gpt-6-astra", StatusCode::OK, COMPLETED_SSE)]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        let _ = body_string(response).await;
+        let scraped = scrape(metrics).await;
+        for (kind, n) in [("prompt", 1000), ("cached", 800), ("cache_write", 150)] {
+            let needle = format!(r#"kind="{kind}",model="-"}} {n}"#);
+            assert!(scraped.contains(&needle), "missing {needle} in {scraped}");
+        }
     }
 }

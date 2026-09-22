@@ -300,19 +300,18 @@ impl Upstream {
         }
     }
 
-    /// Where a request starts looking in the pool. A request carrying a
-    /// session identity (see `affinity_key`) always starts at the same
-    /// account — its session's "home" — so every turn of one Codex session
-    /// lands on one account while it's healthy, and that account's prompt
-    /// cache keeps serving the growing conversation prefix. Anything else
-    /// round-robins from a shared cursor, as before. A single-account pool
-    /// has nothing to choose, so it skips both.
-    fn start_index(&self, client_headers: &reqwest::header::HeaderMap) -> usize {
+    /// Where a request starts looking in the pool. A request with a
+    /// conversation key (see `crate::affinity`) always starts at the same
+    /// account — its conversation's "home" — so every turn lands on one
+    /// account while it's healthy, and that account's prompt cache keeps
+    /// serving the growing conversation prefix. Keyless requests round-robin
+    /// from a shared cursor. A single-account pool has nothing to choose.
+    fn start_index(&self, affinity: Option<u64>) -> usize {
         let len = self.pool.len();
         if len == 1 {
             return 0;
         }
-        match affinity_key(client_headers) {
+        match affinity {
             Some(hash) => (hash % len as u64) as usize,
             None => self.next.fetch_add(1, Ordering::Relaxed) % len,
         }
@@ -418,10 +417,14 @@ impl Upstream {
     /// Never a source for `Authorization` or `ChatGPT-Account-ID`: those two
     /// are always the pool account's own, regardless of anything the client
     /// sent.
+    ///
+    /// `affinity` is the request's conversation-key hash, when it has one
+    /// (see `crate::affinity`): it picks the account the sweep starts from.
     pub async fn forward_responses(
         &self,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
+        affinity: Option<u64>,
     ) -> Result<ForwardedResponse, PoolFailure> {
         let pool_len = self.pool.len();
         let mut tried = vec![false; pool_len];
@@ -430,7 +433,7 @@ impl Upstream {
 
         // Chosen once per request: the sweep below walks the pool from here,
         // each account at most once.
-        let start = self.start_index(client_headers);
+        let start = self.start_index(affinity);
         while let Some((idx, auth_mgr, account)) = self.next_account(start, &tried) {
             tried[idx] = true;
 
@@ -786,31 +789,6 @@ impl Upstream {
             )
         })
     }
-}
-
-/// Client headers that identify one conversation, in order of preference —
-/// the real Codex CLI sends both on every turn (see
-/// `SESSION_IDENTITY_HEADERS`). `session-id` spans the whole session, so it
-/// comes first; `thread-id` alone still keeps one thread together.
-const AFFINITY_HEADERS: &[&str] = &["session-id", "thread-id"];
-
-/// Stable 64-bit hash of the request's session identity, or `None` when the
-/// client sent none (plain OpenAI-style clients) — those round-robin.
-/// FNV-1a rather than `std`'s hasher: the value picks an account, so it must
-/// not change across restarts or Rust versions, or every live session would
-/// move accounts (and lose its prompt cache) on each deploy.
-fn affinity_key(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = AFFINITY_HEADERS
-        .iter()
-        .find_map(|name| headers.get(*name))
-        .map(|v| v.as_bytes())
-        .filter(|v| !v.is_empty())?;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in value {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Some(hash)
 }
 
 /// Upstream statuses that mean "this account can't serve the request right
@@ -1202,7 +1180,7 @@ mod tests {
         let upstream = test_pool(&fake.base_url, 1).await;
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(&*fwd.account, "account-0");
@@ -1217,7 +1195,7 @@ mod tests {
         let mut served = Vec::new();
         for _ in 0..6 {
             let fwd = upstream
-                .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+                .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
                 .await
                 .unwrap();
             served.push(fwd.account.to_string());
@@ -1251,33 +1229,6 @@ mod tests {
         );
     }
 
-    fn session_headers(session: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert("session-id", session.parse().unwrap());
-        headers
-    }
-
-    #[test]
-    fn affinity_key_is_a_fixed_fnv1a_so_sessions_survive_restarts() {
-        // Pinned value: if this changes, every live session moves accounts
-        // (and loses its prompt cache) on the next deploy.
-        assert_eq!(
-            affinity_key(&session_headers("sess-abc")),
-            Some(0x7dcf_79c7_f6fa_627e)
-        );
-        // session-id wins over thread-id; thread-id alone still counts.
-        let mut both = session_headers("sess-abc");
-        both.insert("thread-id", "thread-x".parse().unwrap());
-        assert_eq!(
-            affinity_key(&both),
-            affinity_key(&session_headers("sess-abc"))
-        );
-        let mut thread_only = HeaderMap::new();
-        thread_only.insert("thread-id", "thread-x".parse().unwrap());
-        assert!(affinity_key(&thread_only).is_some());
-        assert_eq!(affinity_key(&HeaderMap::new()), None);
-    }
-
     #[tokio::test]
     async fn a_session_stays_on_its_home_account() {
         let mut fake = start_fake_account_log(8).await;
@@ -1287,7 +1238,8 @@ mod tests {
             let fwd = upstream
                 .forward_responses(
                     bytes::Bytes::from_static(b"{}"),
-                    &session_headers("sess-abc"),
+                    &HeaderMap::new(),
+                    Some(crate::affinity::fnv1a(b"sess-abc")),
                 )
                 .await
                 .unwrap();
@@ -1298,7 +1250,7 @@ mod tests {
         let mut served = Vec::new();
         for _ in 0..3 {
             let fwd = upstream
-                .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+                .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
                 .await
                 .unwrap();
             served.push(fwd.account.to_string());
@@ -1322,7 +1274,8 @@ mod tests {
         let fwd = upstream
             .forward_responses(
                 bytes::Bytes::from_static(b"{}"),
-                &session_headers("sess-abc"),
+                &HeaderMap::new(),
+                Some(crate::affinity::fnv1a(b"sess-abc")),
             )
             .await
             .unwrap();
@@ -1334,7 +1287,8 @@ mod tests {
             let fwd = upstream
                 .forward_responses(
                     bytes::Bytes::from_static(b"{}"),
-                    &session_headers("sess-abc"),
+                    &HeaderMap::new(),
+                    Some(crate::affinity::fnv1a(b"sess-abc")),
                 )
                 .await
                 .unwrap();
@@ -1356,7 +1310,8 @@ mod tests {
         let fwd = upstream
             .forward_responses(
                 bytes::Bytes::from_static(b"{}"),
-                &session_headers("sess-abc"),
+                &HeaderMap::new(),
+                Some(crate::affinity::fnv1a(b"sess-abc")),
             )
             .await
             .unwrap();
@@ -1367,7 +1322,8 @@ mod tests {
         let fwd = upstream
             .forward_responses(
                 bytes::Bytes::from_static(b"{}"),
-                &session_headers("sess-abc"),
+                &HeaderMap::new(),
+                Some(crate::affinity::fnv1a(b"sess-abc")),
             )
             .await
             .unwrap();
@@ -1391,7 +1347,8 @@ mod tests {
         let fwd = upstream
             .forward_responses(
                 bytes::Bytes::from_static(b"{}"),
-                &session_headers("sess-abc"),
+                &HeaderMap::new(),
+                Some(crate::affinity::fnv1a(b"sess-abc")),
             )
             .await
             .unwrap();
@@ -1484,7 +1441,7 @@ mod tests {
         );
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &client_headers)
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &client_headers, None)
             .await
             .unwrap();
 
@@ -1524,7 +1481,7 @@ mod tests {
         );
 
         upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &client_headers)
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &client_headers, None)
             .await
             .unwrap();
 
@@ -1684,7 +1641,7 @@ mod tests {
         );
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fake.recv().await, ("acct-0".to_string(), 429));
@@ -1720,7 +1677,7 @@ mod tests {
         let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1740,7 +1697,7 @@ mod tests {
         // Default 30s cooldown.
         let upstream = test_pool(&fake.base_url, 1).await;
         let _ = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fake.recv().await, ("acct-0".to_string(), 403));
@@ -1760,7 +1717,7 @@ mod tests {
 
         // First request: acct-0 quota 429 -> failover to acct-1.
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(&*fwd.account, "account-1");
@@ -1772,7 +1729,7 @@ mod tests {
         // Second request: round-robin would land on acct-0, but its quota
         // hold (not a cooldown — those are off here) skips it.
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(&*fwd.account, "account-1");
@@ -1792,7 +1749,7 @@ mod tests {
         .await;
         let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
         let _ = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         let _ = fake.recv().await;
@@ -2005,7 +1962,7 @@ mod tests {
         let upstream = test_pool(&fake.base_url, 1).await;
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
@@ -2024,7 +1981,7 @@ mod tests {
         let upstream = test_pool(&fake.base_url, 2).await;
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
@@ -2047,7 +2004,7 @@ mod tests {
         let upstream = test_pool(&fake.base_url, 2).await;
 
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
@@ -2070,7 +2027,7 @@ mod tests {
         // real upstream error, not a synthetic one) with the LAST account's
         // response, not an Err.
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::FORBIDDEN);
@@ -2092,7 +2049,7 @@ mod tests {
         // First request: acct-0 fails over (403, starts its cooldown),
         // acct-1 serves it. Same behavior as `fails_over_to_next_account_on_403`.
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
@@ -2103,7 +2060,7 @@ mod tests {
         // round-robin should skip straight to acct-1 without ever hitting
         // acct-0's endpoint again — exactly one more call, to acct-1.
         let fwd = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
@@ -2152,7 +2109,7 @@ mod tests {
         .await;
         let upstream = test_pool_with_cooldown(&fake.base_url, 1, 0).await;
         let _ = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         let _ = fake.recv().await;
@@ -2225,7 +2182,7 @@ mod tests {
         let upstream = test_pool(&format!("http://{addr}"), 1).await;
 
         let result = upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new())
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await;
         let Err(failure) = result else {
             panic!("a closed port must not yield a response");
