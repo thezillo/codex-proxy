@@ -404,6 +404,11 @@ impl Upstream {
     ///   token refresh plus one retry on that *same* account (mirrors the real
     ///   Codex CLI's own refresh-and-retry-once behavior on 401) — covers
     ///   clock skew or early revocation our proactive expiry check missed.
+    /// - **Replay retry**: a 4xx saying the account can't decrypt replayed
+    ///   `encrypted_content` (minted by another account or provider) triggers
+    ///   one retry on that *same* account without those items — see
+    ///   `crate::replay`. Not a failure of the account: no cooldown, no
+    ///   failover.
     /// - **Failover**: if that account still fails — 401 even after the
     ///   retry, 403 (banned, which no refresh fixes), or 429 (rate-limited,
     ///   the actual reason a multi-account pool exists) — it starts a
