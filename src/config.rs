@@ -289,11 +289,13 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 /// the real Codex CLI bumps, or override via config/`CODEXPROXY_CLI_VERSION`.
 ///
 /// Keep this at or above the highest `minimal_client_version` in the Codex
-/// model catalog for the models we advertise: the catalog gates gpt-6-astra on
-/// 0.153.0, and while the upstream does not currently enforce it server-side
-/// (gpt-6-astra answers fine under an older UA), a request for a model no
-/// build of that CLI version could offer is a needless fingerprint.
-pub const DEFAULT_CLI_VERSION: &str = "0.153.4";
+/// model catalog for the models we advertise: the catalog gates gpt-6-sol and
+/// gpt-6-luna on 0.155.0 (gpt-6-astra on 0.153.0). The upstream did not
+/// enforce this for gpt-6-astra, but a request for a model no build of that
+/// CLI version could offer is a needless fingerprint — and the live catalog
+/// endpoint itself filters by `client_version`, so an old version also hides
+/// new models from anyone listing them through this identity.
+pub const DEFAULT_CLI_VERSION: &str = "0.155.1";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {

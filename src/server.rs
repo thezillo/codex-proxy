@@ -423,8 +423,11 @@ async fn health() -> impl IntoResponse {
 /// given). Current generations only: the ChatGPT-account upstream has dropped
 /// older ones (gpt-5.5 and gpt-5.4 answer 400 "not supported"), so listing
 /// them would only route their traffic onto the paid fallback. The Codex
-/// upstream serves the flavored slugs (gpt-6-astra, and the 5.6
-/// sol/terra/luna trio) over a ChatGPT account; the bare "gpt-6"/"gpt-5.6" names are listed for
+/// upstream serves the flavored slugs (the gpt-6 astra/sol/luna trio and the
+/// 5.6 sol/terra/luna trio) over a ChatGPT account, in the order and with the
+/// `visibility: list` the live Codex catalog (`/backend-api/codex/models`)
+/// gives them; hidden catalog entries (`gpt-reserve`, `codex-auto-review`)
+/// are not advertised. The bare "gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
 /// model aliases — on both POST endpoints, so a client that picks a bare name
 /// out of this very list reaches the subscription pool whichever wire API it
@@ -432,6 +435,8 @@ async fn health() -> impl IntoResponse {
 /// slice.
 const SUPPORTED_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-6",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -2708,6 +2713,50 @@ mod tests {
         assert!(
             scraped.contains(r#"reason="unknown_model"} 2"#),
             "{scraped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpt_6_sol_and_luna_are_accepted_and_advertised() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-sol", StatusCode::OK, "{}"),
+            ("gpt-6-luna", StatusCode::OK, "{}"),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/v1/responses")
+                        .header("Authorization", "Bearer test-key")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+        assert_eq!(pool.seen(), ["gpt-6-sol", "gpt-6-luna"]);
+        let listed = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = body_string(listed).await;
+        assert!(listed.contains("gpt-6-sol") && listed.contains("gpt-6-luna"));
+        assert!(
+            !listed.contains("gpt-reserve"),
+            "hidden catalog models aren't advertised"
         );
     }
 
