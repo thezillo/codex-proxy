@@ -308,6 +308,13 @@ disables the metrics server without disabling collection.
 - `codexproxy_requests_total{endpoint, client, account, model, status}`
 - `codexproxy_tokens_total{client, account, model, kind}` — `kind` is `prompt` or `completion`
 - `codexproxy_request_duration_seconds{endpoint, client, account, model}`
+- `codexproxy_failovers_total{client, model, reason, fallback}` — one per
+  request a paid fallback served; `reason` is the same closed set as the
+  failover log line (`rate_limit`, `quota_exhausted`, `cooling_down`, ...)
+- `codexproxy_model_downgrades_total{client, from, to, outcome}` — in-pool
+  retries with a lower model, `outcome` is `served` or `failed`
+- `codexproxy_rejected_requests_total{client, reason}` — requests refused
+  instead of paid for: `unknown_model` or `pool_bad_request`
 
 `model` is clamped to the models this proxy actually serves — anything else
 shows up as `other`, so a client sending garbage can't create unbounded
@@ -318,7 +325,13 @@ Prometheus series. The access log still shows the real value. On
 is *direct* to the configured provider, never a pool failover, and never
 emits a failover log line. An alert on "served by fallback" should exclude
 it by endpoint (`endpoint!="/v1/embeddings"`), not by provider name — the
-provider is the same one a real failover would use.
+provider is the same one a real failover would use. Or alert on
+`codexproxy_failovers_total` directly, which only ever counts real failovers.
+
+Scraped through a Prometheus Operator `ServiceMonitor`, the app's `endpoint`
+label collides with the target label of the same name (the scrape port) and
+is stored as `exported_endpoint` unless the ServiceMonitor sets
+`honorLabels: true`. Filter on whichever one your setup actually keeps.
 
 ## Multiple ChatGPT accounts
 
@@ -359,12 +372,37 @@ account, as before: a shaky account beats refusing the request. If the chain
 declines a request (no `model_map` entry for that model), the pool is tried
 anyway.
 
+## Cost guardrails (`[models]`)
+
+The paid fallback is only for the pool being *down*. Three things keep it
+from quietly serving traffic the pool refused for other reasons:
+
+- **Unknown models are refused.** With `reject_unknown = true` (default), a
+  model that isn't in `/v1/models` or `[models] extra` gets a 400
+  `model_not_found` listing what's available — before the pool or any paid
+  provider sees it. Checked after `[defaults.model_aliases]`, so `gpt-6`
+  still works as `gpt-6-astra`.
+- **The pool's own 4xx is relayed.** A 400/404/422 from the pool (e.g. `The
+  'gpt-5.5' model is not supported when using Codex with a ChatGPT account`)
+  is the same for every account, so it goes back to the client instead of to
+  the paid chain. `fallback_on_bad_request = true` restores the old behavior.
+- **Throttled models downgrade inside the pool first.** On a plain 429 (or a
+  pool skipped because it's cooling down after one), the request is retried
+  on the pool with the model from `[models.downgrades]` (default
+  `gpt-6-astra -> gpt-5.6-sol`), following the chain. Only if that fails too
+  does the paid chain run — with the client's original model. A
+  `usage_limit_reached` quota 429 skips the downgrade: it's account-wide, so
+  every model would fail the same way.
+
+Each of the three is counted (see Metrics) so an alert can tell a quota
+outage from a client sending a dead model id.
+
 ## Fallback providers
 
 None configured by default. `[[fallback]]` in `config.toml` adds secondary
 Responses-API providers (Azure OpenAI, OpenRouter) tried after the whole
-ChatGPT pool has failed. Any failure anywhere in the chain — pool or
-fallback — moves on to the next option; if everything fails, the client sees
+ChatGPT pool has failed. Any pool failure except a request-level 4xx (see
+Cost guardrails), and any fallback failure, moves on to the next option; if everything fails, the client sees
 the last provider's real error.
 
 Each provider needs a `model_map`, since the model id has to become whatever

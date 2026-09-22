@@ -15,6 +15,7 @@ pub struct Config {
     pub client_auth: ClientAuthConfig,
     pub upstream: UpstreamConfig,
     pub defaults: DefaultsConfig,
+    pub models: ModelsConfig,
     pub logging: LoggingConfig,
     /// Secondary Responses-API-compatible providers (Azure OpenAI, OpenRouter,
     /// ...), tried in order — only once the whole ChatGPT account pool has
@@ -199,6 +200,49 @@ pub struct DefaultsConfig {
     pub include_reasoning: bool,
     /// Map incoming model names to upstream model ids (e.g. "gpt-4o" -> "gpt-5-codex").
     pub model_aliases: HashMap<String, String>,
+}
+
+/// `[models]`: which model ids the proxy accepts, and what it does when the
+/// subscription pool can't serve one — the cost guardrails in front of the
+/// paid `[[fallback]]` chain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ModelsConfig {
+    /// Reject a request whose model (after `defaults.model_aliases`) is not a
+    /// model this proxy knows — the advertised `/v1/models` list plus
+    /// `extra` below — with a 400 `model_not_found`, before it reaches the
+    /// pool or the paid fallback. Off = forward anything, as before.
+    pub reject_unknown: bool,
+    /// Additional accepted model ids beyond the built-in advertised list
+    /// (e.g. a new upstream slug this build doesn't know yet). Accepted, not
+    /// advertised.
+    pub extra: Vec<String>,
+    /// Model downgrade chain inside the subscription pool: when the pool
+    /// throttles a model with a plain 429 (NOT a `usage_limit_reached` quota
+    /// error, which is account-wide and would fail the same way for every
+    /// model), the request is retried on the pool with the model named here,
+    /// following the chain (`a -> b -> c`) until one is served or the chain
+    /// ends — and only then goes to the paid `[[fallback]]` chain, with the
+    /// client's ORIGINAL model. Empty map = no downgrades.
+    pub downgrades: HashMap<String, String>,
+    /// When the pool rejects a request with a 4xx other than 401/403/429
+    /// (typically `400 "model is not supported when using Codex with a
+    /// ChatGPT account"`), send it to the paid `[[fallback]]` chain anyway.
+    /// Off by default: such a rejection is the same for every account, so
+    /// retrying it on a paid provider only hides a client misconfiguration
+    /// behind a bill. The client gets the pool's own error instead.
+    pub fallback_on_bad_request: bool,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            reject_unknown: true,
+            extra: Vec::new(),
+            downgrades: HashMap::from([("gpt-6-astra".to_string(), "gpt-5.6-sol".to_string())]),
+            fallback_on_bad_request: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,6 +537,25 @@ mod tests {
     fn touch_auth_json(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("auth.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn shipped_config_toml_parses_and_its_aliases_pass_the_model_gate() {
+        let cfg: Config =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml parses");
+        assert!(cfg.models.reject_unknown);
+        assert_eq!(
+            cfg.models.downgrades.get("gpt-6-astra").map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
+        // Every alias target must be a model the unknown-model gate accepts,
+        // or the alias would turn a working request into a 400.
+        for target in cfg.defaults.model_aliases.values() {
+            assert!(
+                target.starts_with("gpt-6") || target.starts_with("gpt-5.6"),
+                "alias target {target} would be rejected"
+            );
+        }
     }
 
     #[test]
