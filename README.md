@@ -217,8 +217,10 @@ in the logs, it's one of these three — the message names which.
 - `GET /v1/models`, `GET /v1/models/{id}`, `GET /health`.
 
 `/health` and the model endpoints need no auth (so they work as container
-probes); all `/v1` POST endpoints do. Advertised models: `gpt-6-astra`,
-`gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5`.
+probes); all `/v1` POST endpoints do. Advertised (and, by default, the only
+accepted) models: `gpt-6-astra`, `gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.6-luna`, `gpt-5.6`. Older generations such as `gpt-5.5` are refused
+by the ChatGPT upstream and get a 400 here; see Cost guardrails.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their
@@ -238,7 +240,7 @@ you can see **who** is spending tokens (plus a third on failover, below):
 
 ```
 request accepted   client=alice ip=1.2.3.4 ua=... method=POST path=/v1/chat/completions
-request completed  client=alice account=primary endpoint=/v1/chat/completions model=gpt-5.5 \
+request completed  client=alice account=primary endpoint=/v1/chat/completions model=gpt-6-astra \
                    status=200 prompt_tokens=18 completion_tokens=5 total_tokens=23 duration_ms=1392
 ```
 
