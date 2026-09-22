@@ -219,8 +219,10 @@ in the logs, it's one of these three — the message names which.
 `/health` and the model endpoints need no auth (so they work as container
 probes); all `/v1` POST endpoints do. Advertised (and, by default, the only
 accepted) models: `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`. Older generations such as `gpt-5.5` are refused
-by the ChatGPT upstream and get a 400 here; see Cost guardrails.
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-5.5` — the
+listed entries of the live Codex model catalog. Older generations the catalog
+no longer lists (e.g. `gpt-5.4`) are refused by the ChatGPT upstream and get
+a 400 here; see Cost guardrails.
 
 Function tools are reshaped to the Responses form; hosted tools (`web_search`,
 `image_generation`) pass through. Upstream errors are relayed with their
@@ -416,7 +418,7 @@ from quietly serving traffic the pool refused for other reasons:
   provider sees it. Checked after `[defaults.model_aliases]`, so `gpt-6`
   still works as `gpt-6-astra`.
 - **The pool's own 4xx is relayed.** A 400/404/422 from the pool (e.g. `The
-  'gpt-5.5' model is not supported when using Codex with a ChatGPT account`)
+  'gpt-5.4' model is not supported when using Codex with a ChatGPT account`)
   is the same for every account, so it goes back to the client instead of to
   the paid chain. `fallback_on_bad_request = true` restores the old behavior.
 - **Throttled models downgrade inside the pool first.** On a plain 429 (or a
