@@ -2,6 +2,7 @@
 //! subscription) Responses API over an OpenAI-compatible endpoint, guarded by
 //! client API keys.
 
+mod affinity;
 mod auth;
 mod config;
 mod embeddings;

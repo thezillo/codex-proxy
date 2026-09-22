@@ -163,6 +163,10 @@ pub fn build_codex_request(req: &ChatCompletionRequest, defaults: &DefaultsConfi
         }
     }
 
+    if let Some(key) = req.prompt_cache_key.as_ref().filter(|k| !k.is_empty()) {
+        obj.insert("prompt_cache_key".into(), Value::String(key.clone()));
+    }
+
     // Reasoning: request field overrides the configured default.
     let effort = req
         .reasoning_effort

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::affinity::ConversationKey;
 use crate::config::FallbackProviderConfig;
 use crate::error::ProxyError;
 use crate::upstream::ForwardedResponse;
@@ -31,6 +32,7 @@ struct FallbackProvider {
     responses_url: String,
     auth: FallbackAuth,
     model_map: HashMap<String, String>,
+    sticky_session: bool,
 }
 
 impl FallbackProvider {
@@ -66,6 +68,7 @@ impl FallbackProvider {
             ),
             auth,
             model_map: cfg.model_map.clone(),
+            sticky_session: cfg.sticky_session,
         })
     }
 
@@ -77,10 +80,25 @@ impl FallbackProvider {
     /// the caller skips this provider entirely rather than guessing a name
     /// that likely doesn't exist on this provider (e.g. an Azure deployment
     /// name).
-    fn patch_model(&self, parsed: &serde_json::Value, requested_model: &str) -> Option<Bytes> {
+    ///
+    /// With `sticky_session`, the conversation key is also set as
+    /// `session_id` and `prompt_cache_key` — each only if the body doesn't
+    /// already carry one, so a client's own value always wins.
+    fn patch_model(
+        &self,
+        parsed: &serde_json::Value,
+        requested_model: &str,
+        key: Option<&ConversationKey>,
+    ) -> Option<Bytes> {
         let mapped = self.model_map.get(requested_model)?.clone();
         let mut patched = parsed.clone();
         patched["model"] = serde_json::Value::String(mapped);
+        if let (true, Some(key), Some(obj)) = (self.sticky_session, key, patched.as_object_mut()) {
+            for field in ["session_id", "prompt_cache_key"] {
+                obj.entry(field)
+                    .or_insert_with(|| serde_json::Value::String(key.value.clone()));
+            }
+        }
         Some(Bytes::from(serde_json::to_vec(&patched).ok()?))
     }
 
@@ -162,7 +180,11 @@ impl FallbackChain {
     /// 400/422 from one doesn't imply the same from the next, and a
     /// provider's own 5xx (down/overloaded) is the canonical reason to try
     /// somewhere else.
-    pub async fn run(&self, body: Bytes) -> Option<(ForwardedResponse, Arc<str>)> {
+    pub async fn run(
+        &self,
+        body: Bytes,
+        key: Option<&ConversationKey>,
+    ) -> Option<(ForwardedResponse, Arc<str>)> {
         if self.providers.is_empty() {
             return None;
         }
@@ -178,7 +200,7 @@ impl FallbackChain {
         let mut last = None;
         let mut attempted = false;
         for provider in &self.providers {
-            let Some(patched) = provider.patch_model(&parsed, requested_model) else {
+            let Some(patched) = provider.patch_model(&parsed, requested_model, key) else {
                 continue;
             };
             attempted = true;
@@ -254,6 +276,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            sticky_session: false,
         }
     }
 
@@ -268,7 +291,7 @@ mod tests {
         .unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(r#"{"model":"gpt-5.5","input":"hi"}"#).unwrap();
-        let patched = provider.patch_model(&parsed, "gpt-5.5").unwrap();
+        let patched = provider.patch_model(&parsed, "gpt-5.5", None).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&patched).unwrap();
         assert_eq!(value["model"], "my-deployment");
         assert_eq!(value["input"], "hi");
@@ -279,7 +302,7 @@ mod tests {
         let provider =
             FallbackProvider::new(&provider_cfg("azure", "http://x", "api-key", &[])).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(r#"{"model":"gpt-5.5"}"#).unwrap();
-        assert!(provider.patch_model(&parsed, "gpt-5.5").is_none());
+        assert!(provider.patch_model(&parsed, "gpt-5.5", None).is_none());
     }
 
     #[test]
@@ -351,7 +374,7 @@ mod tests {
         .unwrap();
         let http = reqwest::Client::new();
         let parsed: serde_json::Value = serde_json::from_str(r#"{"model":"gpt-5.5"}"#).unwrap();
-        let patched = provider.patch_model(&parsed, "gpt-5.5").unwrap();
+        let patched = provider.patch_model(&parsed, "gpt-5.5", None).unwrap();
         provider.send(&http, patched).await.unwrap();
 
         let captured = rx.recv().await.unwrap();
@@ -371,7 +394,7 @@ mod tests {
         .unwrap();
         let http = reqwest::Client::new();
         let parsed: serde_json::Value = serde_json::from_str(r#"{"model":"gpt-5.5"}"#).unwrap();
-        let patched = provider.patch_model(&parsed, "gpt-5.5").unwrap();
+        let patched = provider.patch_model(&parsed, "gpt-5.5", None).unwrap();
         provider.send(&http, patched).await.unwrap();
 
         let captured = rx.recv().await.unwrap();
@@ -386,7 +409,7 @@ mod tests {
     async fn run_returns_none_for_empty_chain_without_any_http_call() {
         let chain = FallbackChain::new(reqwest::Client::new(), &[]).unwrap();
         let result = chain
-            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#), None)
             .await;
         assert!(result.is_none());
     }
@@ -409,9 +432,12 @@ mod tests {
         )
         .unwrap();
 
-        assert!(chain.run(Bytes::from_static(b"not json")).await.is_none());
         assert!(chain
-            .run(Bytes::from_static(br#"{"no_model_field":true}"#))
+            .run(Bytes::from_static(b"not json"), None)
+            .await
+            .is_none());
+        assert!(chain
+            .run(Bytes::from_static(br#"{"no_model_field":true}"#), None)
             .await
             .is_none());
         assert!(
@@ -431,7 +457,7 @@ mod tests {
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
         let (result, model) = chain
-            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#), None)
             .await
             .unwrap();
         assert_eq!(&*model, "gpt-5.5");
@@ -458,7 +484,7 @@ mod tests {
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
         let (result, model) = chain
-            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#), None)
             .await
             .unwrap();
         assert_eq!(&*model, "gpt-5.5");
@@ -489,7 +515,7 @@ mod tests {
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
         let (result, model) = chain
-            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#), None)
             .await
             .unwrap();
         assert_eq!(&*model, "gpt-5.5");
@@ -511,7 +537,7 @@ mod tests {
         let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
 
         let (result, model) = chain
-            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#))
+            .run(Bytes::from_static(br#"{"model":"gpt-5.5"}"#), None)
             .await
             .unwrap();
         // Client-facing model, not the per-provider mapped one — it's what

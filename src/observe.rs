@@ -22,7 +22,7 @@ use std::time::Instant;
 use axum::http::HeaderMap;
 
 use crate::error::ProxyError;
-use crate::metrics::{Metrics, RequestOutcome};
+use crate::metrics::{Metrics, RequestOutcome, TokenUsage};
 use crate::upstream::FailureReason;
 
 /// Who a request is attributed to, derived from the matched client key. Carried
@@ -171,6 +171,9 @@ pub struct CompletionLog {
     /// the supported set to `"other"`).
     metric_model: String,
     account: Option<Arc<str>>,
+    /// Where the request's conversation key came from (`header`, `body`,
+    /// `derived`), or `None` when it had none — see `crate::affinity`.
+    affinity: Option<&'static str>,
     started: Instant,
     metrics: Arc<Metrics>,
 }
@@ -189,6 +192,7 @@ impl CompletionLog {
             model: model.into(),
             metric_model: metric_model.into(),
             account: None,
+            affinity: None,
             started: Instant::now(),
             metrics,
         }
@@ -209,12 +213,18 @@ impl CompletionLog {
         self.account = Some(account.into());
     }
 
+    /// Record where this request's conversation key came from.
+    pub fn set_affinity(&mut self, source: &'static str) {
+        self.affinity = Some(source);
+    }
+
     /// Emit the completion line. `usage` is `(prompt_tokens, completion_tokens)`
     /// when known; `None` when the upstream never reported it (e.g. an error
     /// before `response.completed`, or a passthrough body we don't parse).
-    pub fn emit(&self, status: u16, usage: Option<(i64, i64)>) {
+    pub fn emit(&self, status: u16, usage: Option<TokenUsage>) {
         let duration_ms = self.started.elapsed().as_millis() as u64;
-        let (prompt, completion) = usage.unwrap_or((0, 0));
+        let tokens = usage.unwrap_or_default();
+        let (prompt, completion) = (tokens.prompt, tokens.completion);
         tracing::info!(
             target: "access",
             client = %self.ctx.client,
@@ -226,6 +236,9 @@ impl CompletionLog {
             prompt_tokens = prompt,
             completion_tokens = completion,
             total_tokens = prompt + completion,
+            cached_tokens = tokens.cached,
+            cache_write_tokens = tokens.cache_write,
+            affinity = self.affinity.unwrap_or("-"),
             usage_reported = usage.is_some(),
             duration_ms,
             "request completed"
@@ -261,7 +274,7 @@ mod tests {
             metrics.clone(),
         );
         log.set_account("primary");
-        log.emit(200, Some((10, 20)));
+        log.emit(200, Some(TokenUsage::new(10, 20)));
 
         let (_, body) = metrics.encode();
         let text = String::from_utf8(body).unwrap();

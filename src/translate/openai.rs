@@ -20,6 +20,12 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// OpenAI's cache-routing hint, forwarded as-is. `user` is deliberately
+    /// NOT forwarded: the real Codex CLI never sends it, so the ChatGPT
+    /// backend's tolerance for it is unknown, and it adds nothing to cache
+    /// routing that this key doesn't.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

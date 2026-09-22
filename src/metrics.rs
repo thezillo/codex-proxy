@@ -7,6 +7,29 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
 
+/// Token counts for one request. `prompt` includes `cached` (OpenAI's
+/// accounting: cached input is a subset of input, billed at a discount);
+/// `cache_write` is input a provider wrote to its prompt cache — OpenRouter
+/// bills it at a premium for GPT-5.6 and later, so a prompt that is written
+/// every turn and never read back costs MORE than no caching at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub prompt: i64,
+    pub completion: i64,
+    pub cached: i64,
+    pub cache_write: i64,
+}
+
+impl TokenUsage {
+    pub fn new(prompt: i64, completion: i64) -> Self {
+        Self {
+            prompt,
+            completion,
+            ..Self::default()
+        }
+    }
+}
+
 /// One completed request, as `Metrics::record` needs it — bundled into a
 /// struct rather than passed as separate arguments (clippy's
 /// `too_many_arguments`), and it mirrors what `CompletionLog::emit` already
@@ -17,7 +40,7 @@ pub struct RequestOutcome<'a> {
     pub account: &'a str,
     pub model: &'a str,
     pub status: u16,
-    pub usage: Option<(i64, i64)>,
+    pub usage: Option<TokenUsage>,
     pub duration_secs: f64,
 }
 
@@ -47,7 +70,7 @@ impl Metrics {
         let tokens_total = IntCounterVec::new(
             Opts::new(
                 "codexproxy_tokens_total",
-                "Total upstream tokens spent, by client key",
+                "Total upstream tokens spent, by client key; kind is prompt|completion|cached|cache_write (cached is a subset of prompt)",
             ),
             &["client", "account", "model", "kind"],
         )?;
@@ -133,13 +156,22 @@ impl Metrics {
                 outcome.model,
             ])
             .observe(outcome.duration_secs);
-        if let Some((prompt, completion)) = outcome.usage {
+        if let Some(usage) = outcome.usage {
             self.tokens_total
                 .with_label_values(&[outcome.client, outcome.account, outcome.model, "prompt"])
-                .inc_by(prompt.max(0) as u64);
+                .inc_by(usage.prompt.max(0) as u64);
             self.tokens_total
                 .with_label_values(&[outcome.client, outcome.account, outcome.model, "completion"])
-                .inc_by(completion.max(0) as u64);
+                .inc_by(usage.completion.max(0) as u64);
+            // Only when reported: most responses carry no cache write, and a
+            // zero sample would still mint a series per client/account/model.
+            for (kind, count) in [("cached", usage.cached), ("cache_write", usage.cache_write)] {
+                if count > 0 {
+                    self.tokens_total
+                        .with_label_values(&[outcome.client, outcome.account, outcome.model, kind])
+                        .inc_by(count as u64);
+                }
+            }
         }
     }
 
@@ -201,7 +233,7 @@ mod tests {
             account: "primary",
             model: "gpt-5.5",
             status: 200,
-            usage: Some((10, 20)),
+            usage: Some(TokenUsage::new(10, 20)),
             duration_secs: 1.5,
         });
 
@@ -272,7 +304,7 @@ mod tests {
             account: "primary",
             model: "gpt-5.5",
             status: 200,
-            usage: Some((1, 2)),
+            usage: Some(TokenUsage::new(1, 2)),
             duration_secs: 0.1,
         });
 

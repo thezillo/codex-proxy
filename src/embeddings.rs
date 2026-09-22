@@ -158,6 +158,7 @@ mod tests {
             auth_style: "bearer".to_string(),
             api_key: "sk-or-test".to_string(),
             model_map: HashMap::new(),
+            sticky_session: false,
         }
     }
 
