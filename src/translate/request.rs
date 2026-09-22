@@ -23,7 +23,7 @@ use crate::translate::openai::{ChatCompletionRequest, ImageUrl, MessageContent};
 /// odd case of a duplicate top-level `model` key, which serde rejects where
 /// `Value` would take the last. No real client emits duplicates, and every one
 /// of those bodies is forwarded untouched, exactly as before this existed.
-fn model_of(body: &[u8]) -> Option<String> {
+pub fn model_of(body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
     struct ModelOnly {
         model: Option<String>,
@@ -67,6 +67,13 @@ pub fn alias_responses_model(body: &[u8], defaults: &DefaultsConfig) -> Option<V
         return None;
     }
 
+    rewrite_model(body, &requested, mapped)
+}
+
+/// Swap the top-level `model` of a Responses body from `requested` to
+/// `mapped`, keeping every other byte. Shared by the alias rewrite and the
+/// pool's model-downgrade retry — both run on bodies that can be many MB.
+pub fn rewrite_model(body: &[u8], requested: &str, mapped: &str) -> Option<Vec<u8>> {
     // Fast path: splice the new name into the raw bytes. The obvious
     // implementation — parse to `Value`, set the field, reserialize — costs
     // about 4x the body in peak RSS and 4x the time (measured on a 16 MiB
@@ -79,8 +86,8 @@ pub fn alias_responses_model(body: &[u8], defaults: &DefaultsConfig) -> Option<V
     // defeats the byte scan (a nested `"model"` member appearing first) falls
     // through to the tree rewrite rather than being forwarded wrong. That
     // makes correctness depend on serde, not on the scanner.
-    if let Some(spliced) = splice_top_level_model(body, &requested, mapped) {
-        if model_of(&spliced).as_deref() == Some(mapped.as_str()) {
+    if let Some(spliced) = splice_top_level_model(body, requested, mapped) {
+        if model_of(&spliced).as_deref() == Some(mapped) {
             return Some(spliced);
         }
     }
@@ -93,7 +100,7 @@ pub fn alias_responses_model(body: &[u8], defaults: &DefaultsConfig) -> Option<V
     // pays it too. One line, so a step-change in memory has an explanation.
     tracing::debug!(model = %requested, "responses model alias fell back to a full JSON rewrite");
     let mut parsed: Value = serde_json::from_slice(body).ok()?;
-    *parsed.get_mut("model")? = Value::String(mapped.clone());
+    *parsed.get_mut("model")? = Value::String(mapped.to_string());
     serde_json::to_vec(&parsed).ok()
 }
 

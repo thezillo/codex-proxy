@@ -25,8 +25,8 @@ use crate::fallback::FallbackChain;
 use crate::metrics::Metrics;
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
-    alias_responses_model, build_codex_request, collect_chat, stream_chat, tee_responses,
-    ChatCompletionRequest,
+    alias_responses_model, build_codex_request, collect_chat, model_of, rewrite_model, stream_chat,
+    tee_responses, ChatCompletionRequest,
 };
 use crate::upstream::{FailureReason, ForwardedResponse, Upstream};
 
@@ -104,6 +104,41 @@ impl AppState {
             },
         };
 
+        // A 4xx other than 401/403/429 is the pool refusing the REQUEST, not
+        // an account: typically `400 "The 'x' model is not supported when
+        // using Codex with a ChatGPT account"`. Every account would say the
+        // same, and a paid provider that happens to carry the model would
+        // turn the client's misconfiguration into a silent bill (gpt-5.5 ran
+        // on OpenRouter for weeks this way). Relay the pool's own error.
+        if !self.config.models.fallback_on_bad_request {
+            if let Ok(fwd) = &pool_result {
+                let status = fwd.response.status();
+                if fwd.reason.is_none()
+                    && FailureReason::from_status(status) == FailureReason::BadRequest
+                {
+                    self.metrics
+                        .record_rejected(&ctx.client, "pool_bad_request");
+                    tracing::warn!(
+                        target: "access",
+                        client = %ctx.client,
+                        model = %observe::truncate(model.unwrap_or("-")),
+                        account = %fwd.account,
+                        status = status.as_u16(),
+                        "pool rejected the request itself; relayed to the client, not sent to a paid fallback"
+                    );
+                    return pool_result.map_err(ProxyError::from);
+                }
+            }
+        }
+
+        // Throttled on this model? Try a lower one on the SAME pool before
+        // paying anyone.
+        if downgrade_eligible(&pool_result) {
+            if let Some(fwd) = self.try_downgrades(&body, client_headers, ctx).await {
+                return Ok(fwd);
+            }
+        }
+
         match self.fallback.run(body.clone()).await {
             Some((fallback_fwd, dispatched_model)) => {
                 // Status and error are mutually exclusive: a status exists iff
@@ -122,11 +157,18 @@ impl AppState {
                     }
                     Err(f) => (f.reason, f.account.as_deref(), None, Some(&f.error)),
                 };
+                let failover_model = model.unwrap_or(&dispatched_model);
+                self.metrics.record_failover(
+                    &ctx.client,
+                    metric_model_label(failover_model),
+                    reason.as_str(),
+                    &fallback_fwd.account,
+                );
                 observe::log_failover(observe::Failover {
                     ctx,
                     // The chain parsed the body to route it, so it knows the
                     // model even where the passthrough handler doesn't.
-                    model: model.unwrap_or(&dispatched_model),
+                    model: failover_model,
                     request_id: observe::request_id(client_headers),
                     reason,
                     pool_account,
@@ -154,6 +196,135 @@ impl AppState {
             None => pool_result.map_err(ProxyError::from),
         }
     }
+
+    /// Walk `[models.downgrades]` from the body's model, retrying the pool
+    /// with each lower model until one is served. `None` = nothing served
+    /// (no chain for this model, or every step failed) — the caller then
+    /// goes on to the paid fallback with the ORIGINAL body, so a paid
+    /// provider still serves the model the client asked for.
+    ///
+    /// Calls `forward_responses` directly, never `forward_with_fallback`:
+    /// the 429 that got us here just put the account into its cooldown, so
+    /// `Upstream::unavailable` would skip the pool on a second pass — the
+    /// sweep itself still tries a cooling account.
+    ///
+    /// Stops early on anything but a plain 429: a quota 429 is account-wide
+    /// (every model would get it), and any other failure isn't about the
+    /// model at all. Bounded by the chain's length, with a cycle guard.
+    async fn try_downgrades(
+        &self,
+        body: &bytes::Bytes,
+        client_headers: &HeaderMap,
+        ctx: &AccessCtx,
+    ) -> Option<ForwardedResponse> {
+        let downgrades = &self.config.models.downgrades;
+        if downgrades.is_empty() {
+            return None;
+        }
+        let original = model_of(body)?;
+        let mut seen = vec![original.clone()];
+        let mut current = original.clone();
+        while let Some(next) = downgrades.get(&current) {
+            if seen.contains(next) {
+                tracing::warn!(model = %next, "cycle in [models.downgrades]; stopping");
+                return None;
+            }
+            seen.push(next.clone());
+            let lowered = rewrite_model(body, &original, next)?;
+            let result = self
+                .upstream
+                .forward_responses(lowered.into(), client_headers)
+                .await;
+            let served = matches!(&result, Ok(fwd) if fwd.response.status().is_success());
+            self.metrics.record_downgrade(
+                &ctx.client,
+                metric_model_label(&current),
+                metric_model_label(next),
+                served,
+            );
+            tracing::warn!(
+                target: "access",
+                client = %ctx.client,
+                from = %observe::truncate(&current),
+                to = %observe::truncate(next),
+                requested = %observe::truncate(&original),
+                outcome = if served { "served" } else { "failed" },
+                "pool throttled the model; retried the pool with a lower one"
+            );
+            match result {
+                Ok(fwd) if served => return Some(fwd),
+                Ok(fwd) if is_plain_throttle(&fwd) => current = next.clone(),
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
+/// A pool response that is a model-level throttle: 429 and NOT classified as
+/// an account-wide `usage_limit_reached` quota.
+fn is_plain_throttle(fwd: &ForwardedResponse) -> bool {
+    fwd.response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+        && fwd.reason != Some(FailureReason::QuotaExhausted)
+}
+
+/// Whether a failed pool attempt is worth retrying with a lower model: a
+/// plain 429, or a pool skipped because its accounts are cooling down after
+/// one (with a single account, every request right after a throttle lands
+/// here). A quota hold never is — it applies to every model on the account.
+/// A cooldown caused by a 401/403/transport failure qualifies too; that
+/// costs one wasted pool round-trip before the paid fallback, bounded by
+/// the chain length.
+fn downgrade_eligible(
+    pool_result: &Result<ForwardedResponse, crate::upstream::PoolFailure>,
+) -> bool {
+    match pool_result {
+        Ok(fwd) => is_plain_throttle(fwd),
+        Err(f) => f.reason == FailureReason::CoolingDown,
+    }
+}
+
+/// Every model id this proxy accepts: the advertised list plus
+/// `[models] extra`.
+fn is_known_model(config: &Config, model: &str) -> bool {
+    SUPPORTED_MODELS.contains(&model) || config.models.extra.iter().any(|m| m == model)
+}
+
+/// `Some(response)` when `[models] reject_unknown` refuses `model` — a 400 in
+/// the same `model_not_found` shape as `GET /v1/models/{id}`'s 404, listing
+/// what IS available, so the client's author sees the fix in the error
+/// itself. Counted and logged: a client sending a dead model id is exactly
+/// what used to end up billed on the paid fallback.
+fn reject_unknown_model(state: &AppState, ctx: &AccessCtx, model: &str) -> Option<Response> {
+    if !state.config.models.reject_unknown || is_known_model(&state.config, model) {
+        return None;
+    }
+    state.metrics.record_rejected(&ctx.client, "unknown_model");
+    tracing::warn!(
+        target: "access",
+        client = %ctx.client,
+        model = %observe::truncate(model),
+        "unknown model rejected"
+    );
+    let mut available: Vec<&str> = SUPPORTED_MODELS.to_vec();
+    available.extend(state.config.models.extra.iter().map(String::as_str));
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "The model '{model}' is not available on this proxy. Available: {}",
+                        available.join(", ")
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            })),
+        )
+            .into_response(),
+    )
 }
 
 pub fn router(state: AppState) -> Router {
@@ -329,8 +500,17 @@ async fn responses(
         Some(rewritten) => bytes::Bytes::from(rewritten),
         None => body,
     };
+    // A second scan of the body (the alias check did one): a field-only
+    // deserialize, no tree built. `None` (not JSON, no string model) is left
+    // for the upstream to judge, as before.
+    let model = model_of(&body);
+    if let Some(m) = &model {
+        if let Some(rejection) = reject_unknown_model(&state, &ctx, m) {
+            return Ok(rejection);
+        }
+    }
     let fwd = state
-        .forward_with_fallback(body, &headers, &ctx, None)
+        .forward_with_fallback(body, &headers, &ctx, model.as_deref())
         .await?;
     let upstream = fwd.response;
 
@@ -397,6 +577,14 @@ async fn chat_completions(
     );
 
     let codex_body = build_codex_request(&req, &defaults);
+    // Checked after alias resolution: `gpt-6` is fine because it becomes
+    // `gpt-6-astra`; `gpt-5.2-codex` is not, whatever it's called.
+    if let Some(resolved) = codex_body.get("model").and_then(serde_json::Value::as_str) {
+        if let Some(rejection) = reject_unknown_model(&state, log.ctx(), resolved) {
+            log.emit(StatusCode::BAD_REQUEST.as_u16(), None);
+            return Ok(rejection);
+        }
+    }
     let bytes = serde_json::to_vec(&codex_body)
         .map_err(|e| ProxyError::Internal(format!("serialize codex request: {e}")))?;
 
@@ -878,7 +1066,7 @@ mod tests {
                     .header("Content-Type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model": "gpt-5-codex",
+                            "model": "gpt-6-astra",
                             "messages": [
                                 { "role": "system", "content": "be concise" },
                                 { "role": "user", "content": "hi" }
@@ -913,7 +1101,7 @@ mod tests {
         assert_eq!(captured.accept.as_deref(), Some("text/event-stream"));
 
         let upstream_request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
-        assert_eq!(upstream_request["model"], "gpt-5-codex");
+        assert_eq!(upstream_request["model"], "gpt-6-astra");
         assert_eq!(upstream_request["instructions"], "be concise");
         assert_eq!(upstream_request["input"][0]["role"], "user");
         assert_eq!(upstream_request["input"][0]["content"], "hi");
@@ -943,7 +1131,7 @@ mod tests {
                     .header("Content-Type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model": "gpt-5-codex",
+                            "model": "gpt-6-astra",
                             "messages": [{ "role": "user", "content": "hi" }],
                             "stream": true
                         })
@@ -2078,5 +2266,395 @@ mod tests {
             .unwrap();
         assert_eq!(received.len(), 200, "must truncate exactly to the cap");
         assert!(received.len() < body.len());
+    }
+
+    // ---- cost guardrails: model downgrades, pool 400 relay, unknown models ----
+
+    /// Build a router (and keep its metrics) from a fully custom config — the
+    /// guardrail tests flip `[models]` switches the other helpers don't expose.
+    fn guarded_router(config: Config) -> (axum::Router, Arc<Metrics>) {
+        let http = reqwest::Client::new();
+        let auth = AuthManager::load(
+            &config.upstream,
+            write_test_auth_json("acct_test"),
+            http.clone(),
+        )
+        .expect("load test auth");
+        let upstream = Arc::new(Upstream::new(
+            &config.upstream,
+            http.clone(),
+            vec![(auth, "test-account".to_string())],
+        ));
+        let fallback =
+            Arc::new(FallbackChain::new(http, &config.fallback).expect("build fallback chain"));
+        let metrics = Arc::new(Metrics::new().expect("build metrics"));
+        let app = router(AppState {
+            config: Arc::new(config),
+            upstream,
+            fallback,
+            metrics: metrics.clone(),
+            embeddings: None,
+        });
+        (app, metrics)
+    }
+
+    fn guarded_config(pool_url: &str, fallback_url: &str, cooldown_secs: u64) -> Config {
+        let mut config = Config::default();
+        config.client_auth.keys = vec![bare_key("test-key")];
+        config.upstream.base_url = pool_url.to_string();
+        config.upstream.account_cooldown_secs = cooldown_secs;
+        let mut provider = fallback_provider_cfg("fb", fallback_url);
+        provider
+            .model_map
+            .insert("gpt-6-astra".to_string(), "astra-on-fallback".to_string());
+        config.fallback = vec![provider];
+        config
+    }
+
+    /// A pool that answers per requested model — the other fakes answer the
+    /// same thing whatever they're sent, which can't show a downgrade working.
+    /// Records every model it was asked for, in order.
+    struct ModelAwareUpstream {
+        base_url: String,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ModelAwareUpstream {
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    async fn start_model_aware_upstream(
+        replies: Vec<(&'static str, StatusCode, &'static str)>,
+    ) -> ModelAwareUpstream {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(replies);
+        let handler = {
+            let seen = seen.clone();
+            move |body: Bytes| {
+                let seen = seen.clone();
+                let replies = replies.clone();
+                async move {
+                    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let model = parsed["model"].as_str().unwrap_or("").to_string();
+                    seen.lock().unwrap().push(model.clone());
+                    let (status, reply) = replies
+                        .iter()
+                        .find(|(m, _, _)| *m == model)
+                        .map(|(_, s, b)| (*s, *b))
+                        .unwrap_or((StatusCode::IM_A_TEAPOT, "unexpected model"));
+                    Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(reply))
+                        .unwrap()
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/codex/responses", post(handler.clone()))
+            .route("/responses", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        ModelAwareUpstream {
+            base_url: format!("http://{addr}"),
+            seen,
+        }
+    }
+
+    async fn body_string(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn scrape(metrics: Arc<Metrics>) -> String {
+        let response = metrics_router(metrics)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_string(response).await
+    }
+
+    const THROTTLE_429: &str = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+
+    #[tokio::test]
+    async fn throttled_model_is_served_by_a_lower_model_on_the_pool() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+            ("gpt-5.6-sol", StatusCode::OK, r#"{"ok":"sol"}"#),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, r#"{"ok":"sol"}"#);
+        assert_eq!(pool.seen(), ["gpt-6-astra", "gpt-5.6-sol"]);
+        assert!(
+            fallback.seen().is_empty(),
+            "no paid fallback when the downgrade served"
+        );
+        assert!(scrape(metrics)
+            .await
+            .contains(r#"codexproxy_model_downgrades_total{client="key-"#));
+    }
+
+    #[tokio::test]
+    async fn cooling_pool_still_gets_the_downgrade_before_the_paid_fallback() {
+        // One account, 30s cooldown: after the first 429 every request finds
+        // the pool "unavailable". The downgrade must still go to the pool.
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+            ("gpt-5.6-sol", StatusCode::OK, r#"{"ok":"sol"}"#),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // Request 2 skipped the cooling astra attempt and went straight to sol.
+        assert_eq!(pool.seen(), ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-sol"]);
+        assert!(fallback.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_downgrade_falls_back_with_the_original_model() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+            ("gpt-5.6-sol", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "astra-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, r#"{"ok":"fb"}"#);
+        assert_eq!(pool.seen(), ["gpt-6-astra", "gpt-5.6-sol"]);
+        assert_eq!(fallback.seen(), ["astra-on-fallback"]);
+        let scraped = scrape(metrics).await;
+        assert!(scraped.contains(r#"outcome="failed""#), "{scraped}");
+        assert!(
+            scraped.contains(r#"codexproxy_failovers_total{client="key-"#)
+                && scraped.contains(r#"model="gpt-6-astra",reason="rate_limit""#),
+            "{scraped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_429_is_account_wide_so_no_downgrade_is_tried() {
+        let pool = start_model_aware_upstream(vec![
+            (
+                "gpt-6-astra",
+                StatusCode::TOO_MANY_REQUESTS,
+                USAGE_LIMIT_429_BODY,
+            ),
+            ("gpt-5.6-sol", StatusCode::OK, r#"{"ok":"sol"}"#),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "astra-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 0));
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pool.seen(), ["gpt-6-astra"]);
+        assert_eq!(fallback.seen(), ["astra-on-fallback"]);
+    }
+
+    #[tokio::test]
+    async fn empty_downgrade_map_goes_straight_to_the_fallback() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+            ("gpt-5.6-sol", StatusCode::OK, r#"{"ok":"sol"}"#),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "astra-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let mut config = guarded_config(&pool.base_url, &fallback.base_url, 30);
+        config.models.downgrades.clear();
+        let (app, _) = guarded_router(config);
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pool.seen(), ["gpt-6-astra"]);
+        assert_eq!(fallback.seen(), ["astra-on-fallback"]);
+    }
+
+    #[tokio::test]
+    async fn pool_400_is_relayed_instead_of_paying_the_fallback() {
+        const REFUSED: &str = r#"{"detail":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}"#;
+        let pool =
+            start_model_aware_upstream(vec![("gpt-5.5", StatusCode::BAD_REQUEST, REFUSED)]).await;
+        let fallback = start_model_aware_upstream(vec![(
+            "gpt-5.5-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_string(response).await, REFUSED);
+        assert!(fallback.seen().is_empty());
+        assert!(scrape(metrics)
+            .await
+            .contains(r#"reason="pool_bad_request""#));
+    }
+
+    #[tokio::test]
+    async fn pool_400_still_falls_back_when_explicitly_allowed() {
+        let pool =
+            start_model_aware_upstream(vec![("gpt-5.5", StatusCode::BAD_REQUEST, "{}")]).await;
+        let fallback = start_model_aware_upstream(vec![(
+            "gpt-5.5-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let mut config = guarded_config(&pool.base_url, &fallback.base_url, 30);
+        config.models.fallback_on_bad_request = true;
+        let (app, _) = guarded_router(config);
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-5.5","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fallback.seen(), ["gpt-5.5-on-fallback"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_rejected_before_any_upstream_on_both_endpoints() {
+        let pool = start_model_aware_upstream(vec![]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let (app, metrics) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
+
+        let response = app
+            .clone()
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.2-codex","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gpt-6-astra"));
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("Authorization", "Bearer test-key")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "gpt-4.1", "messages": [{"role": "user", "content": "hi"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert!(pool.seen().is_empty() && fallback.seen().is_empty());
+        let scraped = scrape(metrics).await;
+        assert!(
+            scraped.contains(r#"reason="unknown_model"} 2"#),
+            "{scraped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_and_extra_models_pass_the_unknown_model_gate() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::OK, "{}"),
+            ("gpt-6-astra-pro", StatusCode::OK, "{}"),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let mut config = guarded_config(&pool.base_url, &fallback.base_url, 30);
+        config.models.extra = vec!["gpt-6-astra-pro".to_string()];
+        let (app, _) = guarded_router(config);
+
+        for body in [
+            r#"{"model":"gpt-6","input":"hi"}"#,
+            r#"{"model":"gpt-6-astra-pro","input":"hi"}"#,
+        ] {
+            let response = app.clone().oneshot(responses_request(body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{body}");
+        }
+        assert_eq!(pool.seen(), ["gpt-6-astra", "gpt-6-astra-pro"]);
+    }
+
+    #[tokio::test]
+    async fn unknown_models_pass_through_when_the_gate_is_off() {
+        let pool = start_model_aware_upstream(vec![("gpt-5.2-codex", StatusCode::OK, "{}")]).await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        let mut config = guarded_config(&pool.base_url, &fallback.base_url, 30);
+        config.models.reject_unknown = false;
+        let (app, _) = guarded_router(config);
+
+        let response = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.2-codex","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pool.seen(), ["gpt-5.2-codex"]);
     }
 }

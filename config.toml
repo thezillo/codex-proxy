@@ -120,9 +120,27 @@ include_reasoning = false
 [defaults.model_aliases]
 "gpt-6" = "gpt-6-astra"
 "gpt-5.6" = "gpt-5.6-sol"
-"gpt-4o" = "gpt-5-codex"
-"gpt-4.1" = "gpt-5-codex"
-"gpt-5" = "gpt-5"
+"gpt-4o" = "gpt-6-astra"
+"gpt-4.1" = "gpt-6-astra"
+
+# Cost guardrails in front of the paid [[fallback]] chain.
+[models]
+# Refuse (400 model_not_found) any model that isn't in /v1/models or `extra`,
+# checked after model_aliases — before the pool or a paid provider sees it.
+reject_unknown = true
+# Accepted in addition to the advertised list (e.g. a brand-new upstream slug).
+extra = []
+# A pool 4xx other than 401/403/429 (e.g. "model is not supported when using
+# Codex with a ChatGPT account") is relayed to the client by default. true =
+# send it to the paid fallback anyway (the pre-guardrail behavior).
+fallback_on_bad_request = false
+
+# When the pool throttles a model with a plain 429, retry the POOL with a
+# lower model before paying the fallback; the chain is followed (a -> b -> c).
+# A usage_limit_reached quota 429 is account-wide and skips this. Defining the
+# section replaces the built-in map; an empty section disables downgrades.
+[models.downgrades]
+"gpt-6-astra" = "gpt-5.6-sol"
 
 [logging]
 # trace | debug | info | warn | error

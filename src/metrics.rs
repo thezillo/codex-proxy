@@ -26,6 +26,9 @@ pub struct Metrics {
     requests_total: IntCounterVec,
     tokens_total: IntCounterVec,
     request_duration_seconds: HistogramVec,
+    failovers_total: IntCounterVec,
+    model_downgrades_total: IntCounterVec,
+    rejected_requests_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -65,11 +68,47 @@ impl Metrics {
         )?;
         registry.register(Box::new(request_duration_seconds.clone()))?;
 
+        // The cost-alerting counters. `codexproxy_requests_total` only says
+        // which account served a request; these say WHY the pool didn't —
+        // quota vs throttle vs a model the pool refuses — which is what an
+        // alert has to tell apart (a quota hit waits for a reset, a refused
+        // model is a client to fix). Every label is a closed set: `model`
+        // is clamped by the caller, `reason` is `FailureReason::as_str`.
+        let failovers_total = IntCounterVec::new(
+            Opts::new(
+                "codexproxy_failovers_total",
+                "Requests the subscription pool could not serve that a paid fallback provider served instead",
+            ),
+            &["client", "model", "reason", "fallback"],
+        )?;
+        registry.register(Box::new(failovers_total.clone()))?;
+
+        let model_downgrades_total = IntCounterVec::new(
+            Opts::new(
+                "codexproxy_model_downgrades_total",
+                "Pool retries with a lower model after the requested one was throttled, by outcome (served|failed)",
+            ),
+            &["client", "from", "to", "outcome"],
+        )?;
+        registry.register(Box::new(model_downgrades_total.clone()))?;
+
+        let rejected_requests_total = IntCounterVec::new(
+            Opts::new(
+                "codexproxy_rejected_requests_total",
+                "Requests refused instead of forwarded to a paid fallback: unknown_model (proxy-side) or pool_bad_request (the pool's own 4xx, relayed)",
+            ),
+            &["client", "reason"],
+        )?;
+        registry.register(Box::new(rejected_requests_total.clone()))?;
+
         Ok(Self {
             registry,
             requests_total,
             tokens_total,
             request_duration_seconds,
+            failovers_total,
+            model_downgrades_total,
+            rejected_requests_total,
         })
     }
 
@@ -102,6 +141,30 @@ impl Metrics {
                 .with_label_values(&[outcome.client, outcome.account, outcome.model, "completion"])
                 .inc_by(completion.max(0) as u64);
         }
+    }
+
+    /// One pool -> paid-fallback switch. Called next to `log_failover`.
+    pub fn record_failover(&self, client: &str, model: &str, reason: &str, fallback: &str) {
+        self.failovers_total
+            .with_label_values(&[client, model, reason, fallback])
+            .inc();
+    }
+
+    /// One in-pool model downgrade attempt; `served` = the lower model
+    /// answered, so no paid fallback was needed for this request.
+    pub fn record_downgrade(&self, client: &str, from: &str, to: &str, served: bool) {
+        let outcome = if served { "served" } else { "failed" };
+        self.model_downgrades_total
+            .with_label_values(&[client, from, to, outcome])
+            .inc();
+    }
+
+    /// One request refused rather than paid for; `reason` is
+    /// `unknown_model` or `pool_bad_request`.
+    pub fn record_rejected(&self, client: &str, reason: &str) {
+        self.rejected_requests_total
+            .with_label_values(&[client, reason])
+            .inc();
     }
 
     /// Prometheus text-exposition encoding of the current metric values, for
