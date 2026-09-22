@@ -423,7 +423,10 @@ up front — only after that specific rejection — and each recovery logs a
 `could not decrypt replayed state` warning with the number of items dropped.
 The cost: hidden reasoning from earlier turns is gone for the new upstream
 (it couldn't read it anyway), and a dropped `compaction` item takes the
-history it summarized with it.
+history it summarized with it. Codex keeps the foreign items in its own
+history, so until the session is restarted every later turn pays one rejected
+round-trip (no tokens billed) and logs the warning again — expected, not a
+new failure.
 
 ## Cost guardrails (`[models]`)
 
