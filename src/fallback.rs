@@ -204,7 +204,10 @@ impl FallbackChain {
                 continue;
             };
             attempted = true;
-            match provider.send(&self.http, patched).await {
+            match self
+                .send_recovering(provider, patched, &parsed, requested_model, key)
+                .await
+            {
                 Ok(response) => {
                     if !response.status().is_success() {
                         tracing::warn!(
@@ -245,6 +248,50 @@ impl FallbackChain {
             );
         }
         last.map(|fwd| (fwd, model))
+    }
+}
+
+impl FallbackChain {
+    /// `provider.send`, plus one retry on the same provider when it rejects
+    /// encrypted state replayed from another upstream (see `crate::replay`)
+    /// — the ChatGPT account that served the session so far, typically, or
+    /// another fallback provider. The retry drops the items carrying that
+    /// state; `patch_model` runs again on the stripped body so the provider
+    /// still gets its own model name and session fields.
+    async fn send_recovering(
+        &self,
+        provider: &FallbackProvider,
+        patched: Bytes,
+        parsed: &serde_json::Value,
+        requested_model: &str,
+        key: Option<&ConversationKey>,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let response = provider.send(&self.http, patched).await?;
+        if !crate::replay::may_be_undecryptable(response.status()) {
+            return Ok(response);
+        }
+        let (response, error_body) =
+            crate::upstream::buffer_error_body(&provider.name, response).await;
+        if !error_body.is_some_and(|b| crate::replay::is_undecryptable(&b)) {
+            return Ok(response);
+        }
+        let Some(retry) =
+            crate::replay::strip_encrypted_items(parsed).and_then(|(stripped, dropped)| {
+                Some((
+                    provider.patch_model(&stripped, requested_model, key)?,
+                    dropped,
+                ))
+            })
+        else {
+            return Ok(response);
+        };
+        let (body, dropped) = retry;
+        tracing::warn!(
+            provider = %provider.name,
+            dropped,
+            "fallback provider could not decrypt replayed state from another upstream; retrying once without it"
+        );
+        provider.send(&self.http, body).await
     }
 }
 
@@ -549,5 +596,39 @@ mod tests {
             "provider without a mapping for this model must never receive a request"
         );
         assert!(rx_b.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn undecryptable_replay_is_retried_once_on_the_same_provider_without_it() {
+        use crate::test_support::{
+            input_types, start_replay_rejecting_upstream, FOREIGN_REPLAY_BODY,
+        };
+        let mut fake = start_replay_rejecting_upstream("/responses", false).await;
+        let (url_next, mut rx_next) = start_fake_provider(200).await;
+        let cfgs = vec![
+            provider_cfg("fb", &fake.base_url, "bearer", &[("gpt-5.5", "model-a")]),
+            provider_cfg("next", &url_next, "bearer", &[("gpt-5.5", "model-b")]),
+        ];
+        let chain = FallbackChain::new(reqwest::Client::new(), &cfgs).unwrap();
+
+        let (result, _) = chain
+            .run(Bytes::from_static(FOREIGN_REPLAY_BODY.as_bytes()), None)
+            .await
+            .unwrap();
+        assert_eq!(result.response.status(), reqwest::StatusCode::OK);
+        assert_eq!(&*result.account, "fb");
+
+        let first = fake.rx.recv().await.unwrap();
+        assert_eq!(input_types(&first.body).len(), 4);
+        let retry = fake.rx.recv().await.unwrap();
+        assert_eq!(retry.body["model"], "model-a", "retry is re-patched");
+        assert_eq!(
+            input_types(&retry.body),
+            ["message", "function_call", "function_call_output"]
+        );
+        assert!(
+            rx_next.try_recv().is_err(),
+            "a recovered provider must not cascade to the next one"
+        );
     }
 }

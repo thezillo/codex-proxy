@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::auth::AuthManager;
 use crate::config::UpstreamConfig;
 use crate::error::ProxyError;
+use crate::replay;
 
 /// One ChatGPT account in the round-robin pool.
 struct PoolEntry {
@@ -116,10 +117,11 @@ const QUOTA_HOLD_DEFAULT: Duration = Duration::from_secs(600);
 /// timestamp (the longest real Codex window is a week).
 const QUOTA_HOLD_MIN: Duration = Duration::from_secs(60);
 const QUOTA_HOLD_MAX: Duration = Duration::from_secs(8 * 24 * 3600);
-/// Most bytes of a 429 body we'll classify. A real usage-limit error is a
-/// few hundred bytes; anything bigger is not one and isn't classified (and,
-/// when `Content-Length` declares it up front, isn't buffered either).
-const RATE_LIMIT_BODY_MAX_BYTES: usize = 64 * 1024;
+/// Most bytes of an error body we'll classify (a 429 for a quota, a 4xx for
+/// an undecryptable replay). The real errors are a few hundred bytes;
+/// anything bigger is neither and isn't classified (and, when
+/// `Content-Length` declares it up front, isn't buffered either).
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Whole-request timeout for one usage poll. Background work; nothing
 /// waits on it except the next tick.
 const USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -526,48 +528,21 @@ impl Upstream {
     async fn classify_rate_limit(
         &self,
         account: &Arc<str>,
-        mut response: reqwest::Response,
+        response: reqwest::Response,
     ) -> (reqwest::Response, Option<QuotaHold>) {
         if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
             return (response, None);
         }
-        // Only a declared oversized body is passed through unread. reqwest
-        // strips `Content-Length` when it decompresses, so a compressed or
-        // chunked 429 reports no length and is buffered whole regardless —
-        // the post-read size check below then only skips classification.
-        // Acceptable: a real usage-limit error is a few hundred bytes.
-        if response
-            .content_length()
-            .is_some_and(|len| len > RATE_LIMIT_BODY_MAX_BYTES as u64)
-        {
-            return (response, None);
-        }
-        let status = response.status();
-        let version = response.version();
-        let headers = std::mem::take(response.headers_mut());
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(e) => {
-                // The client would have hit the same broken body; hand it an
-                // empty one with the real status rather than a synthetic 502.
-                // Without the body this 429 can't be told from a throttle,
-                // so say so: the account comes back after the short cooldown.
-                tracing::warn!(
-                    %account,
-                    error = %e,
-                    "could not read 429 body; no quota hold applied, account retried after cooldown"
-                );
-                bytes::Bytes::new()
-            }
-        };
-        let hold = (body.len() <= RATE_LIMIT_BODY_MAX_BYTES)
-            .then(|| usage_limit_hold(&headers, &body, unix_now(), self.quota_hold_default()))
-            .flatten();
-        let mut rebuilt = axum::http::Response::new(body);
-        *rebuilt.status_mut() = status;
-        *rebuilt.version_mut() = version;
-        *rebuilt.headers_mut() = headers;
-        (reqwest::Response::from(rebuilt), hold)
+        let (response, body) = buffer_error_body(account, response).await;
+        let hold = body.and_then(|body| {
+            usage_limit_hold(
+                response.headers(),
+                &body,
+                unix_now(),
+                self.quota_hold_default(),
+            )
+        });
+        (response, hold)
     }
 
     /// Hold for a quota-exhausted account when the 429 gave no usable reset
@@ -696,8 +671,44 @@ impl Upstream {
 
     /// Try one pool account: send once, and if the upstream says 401, force a
     /// token refresh and retry once more on this same account before
-    /// reporting it as failed.
+    /// reporting it as failed. If the account instead rejects encrypted
+    /// state replayed from another upstream (see `crate::replay`), retry once
+    /// more on it without those items.
     async fn try_account(
+        &self,
+        auth_mgr: &AuthManager,
+        account: &Arc<str>,
+        body: bytes::Bytes,
+        client_headers: &reqwest::header::HeaderMap,
+    ) -> Result<reqwest::Response, PoolFailure> {
+        let response = self
+            .send_refreshing(auth_mgr, account, body.clone(), client_headers)
+            .await?;
+        if !replay::may_be_undecryptable(response.status()) {
+            return Ok(response);
+        }
+        let (response, error_body) = buffer_error_body(account, response).await;
+        if !error_body.is_some_and(|b| replay::is_undecryptable(&b)) {
+            return Ok(response);
+        }
+        let Some((stripped, dropped)) = replay::strip_encrypted_body(&body) else {
+            tracing::warn!(
+                %account,
+                "upstream could not decrypt replayed state, but the request carries no encrypted items to drop"
+            );
+            return Ok(response);
+        };
+        tracing::warn!(
+            %account,
+            dropped,
+            "upstream could not decrypt replayed state from another upstream; retrying once without it"
+        );
+        self.send_refreshing(auth_mgr, account, stripped, client_headers)
+            .await
+    }
+
+    /// Send once, and on a 401 force a token refresh and send once more.
+    async fn send_refreshing(
         &self,
         auth_mgr: &AuthManager,
         account: &Arc<str>,
@@ -806,6 +817,51 @@ pub(crate) fn is_account_failure(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::FORBIDDEN
             | reqwest::StatusCode::TOO_MANY_REQUESTS
     )
+}
+
+/// Buffer a small error body so it can be classified, and rebuild the
+/// response around it — status and headers intact — for the client, which
+/// must still see the real upstream error if nothing recovers it. `None`
+/// (response passed through unread) for a body declared larger than
+/// `ERROR_BODY_MAX_BYTES`; `None` too, with an empty body, if it couldn't be
+/// read — the client would have hit the same broken body.
+///
+/// Only a declared oversized body is passed through unread. reqwest strips
+/// `Content-Length` when it decompresses, so a compressed or chunked error
+/// reports no length and is buffered whole regardless — the post-read size
+/// check then only skips classification. Acceptable: the errors worth
+/// classifying are a few hundred bytes.
+pub(crate) async fn buffer_error_body(
+    account: &str,
+    mut response: reqwest::Response,
+) -> (reqwest::Response, Option<bytes::Bytes>) {
+    if response
+        .content_length()
+        .is_some_and(|len| len > ERROR_BODY_MAX_BYTES as u64)
+    {
+        return (response, None);
+    }
+    let status = response.status();
+    let version = response.version();
+    let headers = std::mem::take(response.headers_mut());
+    let body = match response.bytes().await {
+        Ok(body) => Some(body),
+        Err(e) => {
+            tracing::warn!(
+                %account,
+                %status,
+                error = %e,
+                "could not read upstream error body; relaying it empty, unclassified"
+            );
+            None
+        }
+    };
+    let mut rebuilt = axum::http::Response::new(body.clone().unwrap_or_default());
+    *rebuilt.status_mut() = status;
+    *rebuilt.version_mut() = version;
+    *rebuilt.headers_mut() = headers;
+    let body = body.filter(|b| b.len() <= ERROR_BODY_MAX_BYTES);
+    (reqwest::Response::from(rebuilt), body)
 }
 
 fn unix_now() -> u64 {
@@ -1097,7 +1153,10 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::test_support::{write_test_auth_json, USAGE_LIMIT_429_BODY};
+    use crate::test_support::{
+        input_types, start_replay_rejecting_upstream, write_test_auth_json, FOREIGN_REPLAY_BODY,
+        USAGE_LIMIT_429_BODY,
+    };
 
     /// Fake upstream capturing the `ChatGPT-Account-ID` of every request it
     /// receives, in order — enough to assert a round-robin sequence. Distinct
@@ -2189,5 +2248,80 @@ mod tests {
         };
         assert_eq!(failure.reason, FailureReason::Transport);
         assert_eq!(failure.account.as_deref(), Some("account-0"));
+    }
+
+    #[tokio::test]
+    async fn undecryptable_replay_is_retried_once_on_the_same_account_without_it() {
+        let mut fake = start_replay_rejecting_upstream("/codex/responses", false).await;
+        let upstream = test_pool(&fake.base_url, 2).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(FOREIGN_REPLAY_BODY.as_bytes()),
+                &reqwest::header::HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fwd.response.status(), reqwest::StatusCode::OK);
+
+        let first = fake.rx.recv().await.unwrap();
+        let retry = fake.rx.recv().await.unwrap();
+        assert_eq!(
+            first.headers.get("chatgpt-account-id"),
+            retry.headers.get("chatgpt-account-id"),
+            "the retry must stay on the account that rejected the replay"
+        );
+        assert_eq!(
+            input_types(&retry.body),
+            ["message", "function_call", "function_call_output"]
+        );
+        assert!(fake.rx.try_recv().is_err(), "exactly one retry");
+        assert!(
+            upstream.unavailable().is_none(),
+            "a rejected replay is no account failure: nothing cools down"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecryptable_replay_with_nothing_to_drop_is_relayed_without_a_retry() {
+        let mut fake = start_replay_rejecting_upstream("/codex/responses", true).await;
+        let upstream = test_pool(&fake.base_url, 1).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(br#"{"model":"gpt-5.5","input":"hi"}"#),
+                &reqwest::header::HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fwd.response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = fwd.response.bytes().await.unwrap();
+        assert!(
+            crate::replay::is_undecryptable(&body),
+            "error body relayed intact"
+        );
+        assert!(fake.rx.recv().await.is_some());
+        assert!(fake.rx.try_recv().is_err(), "no retry");
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_is_rejected_again_is_relayed_not_retried_further() {
+        let mut fake = start_replay_rejecting_upstream("/codex/responses", true).await;
+        let upstream = test_pool(&fake.base_url, 1).await;
+
+        let fwd = upstream
+            .forward_responses(
+                bytes::Bytes::from_static(FOREIGN_REPLAY_BODY.as_bytes()),
+                &reqwest::header::HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fwd.response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(fake.rx.recv().await.is_some());
+        assert!(fake.rx.recv().await.is_some());
+        assert!(fake.rx.try_recv().is_err(), "at most one retry");
     }
 }

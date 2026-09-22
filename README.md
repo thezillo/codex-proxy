@@ -407,6 +407,24 @@ account, as before: a shaky account beats refusing the request. If the chain
 declines a request (no `model_map` entry for that model), the pool is tried
 anyway.
 
+### Sessions surviving a switch
+
+Codex resends its whole history every turn, including `reasoning` (and,
+after a compaction, `compaction`) items whose `encrypted_content` only the
+upstream that minted them can decrypt. After a failover — account 1 to
+account 2, the pool to a `[[fallback]]` provider, or back once the quota
+resets — the new upstream rejects that replay with `400
+invalid_encrypted_content`, which used to end the session.
+
+The proxy now retries such a request once, on the same account or provider,
+without the input items that carry `encrypted_content`; messages and tool
+calls/outputs are kept, so the session goes on. Requests are never modified
+up front — only after that specific rejection — and each recovery logs a
+`could not decrypt replayed state` warning with the number of items dropped.
+The cost: hidden reasoning from earlier turns is gone for the new upstream
+(it couldn't read it anyway), and a dropped `compaction` item takes the
+history it summarized with it.
+
 ## Cost guardrails (`[models]`)
 
 The paid fallback is only for the pool being *down*. Three things keep it
