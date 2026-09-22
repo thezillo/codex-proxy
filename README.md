@@ -53,7 +53,7 @@ starting with `gpt-`/`o`) is replaced by `defaults.model` (`gpt-6-astra`);
 empty; after that the rotated token on the volume wins, so the env var is
 harmless on later restarts but also can't be used to *replace* credentials.
 
-Image tags: `latest`, `v0.3.2`, `sha-<commit>` (GHCR, built on push to `main`
+Image tags: `latest`, `v0.3.3`, `sha-<commit>` (GHCR, built on push to `main`
 and on `v*` tags). Pin a digest for anything you care about.
 
 ## Full run (named keys, metrics, fallback)
