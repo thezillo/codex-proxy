@@ -420,14 +420,12 @@ async fn health() -> impl IntoResponse {
 
 /// Models this proxy advertises AND accepts (see `[models] reject_unknown`),
 /// most capable first (the order is client-visible — pickers render it as
-/// given). Current generations only: the ChatGPT-account upstream has dropped
-/// older ones (gpt-5.5 and gpt-5.4 answer 400 "not supported"), so listing
-/// them would only route their traffic onto the paid fallback. The Codex
-/// upstream serves the flavored slugs (the gpt-6 astra/sol/luna trio and the
-/// 5.6 sol/terra/luna trio) over a ChatGPT account, in the order and with the
-/// `visibility: list` the live Codex catalog (`/backend-api/codex/models`)
-/// gives them; hidden catalog entries (`gpt-reserve`, `codex-auto-review`)
-/// are not advertised. The bare "gpt-6"/"gpt-5.6" names are listed for
+/// given). Exactly the `visibility: list` entries of the live Codex catalog
+/// (`/backend-api/codex/models`), in its order: the gpt-6 astra/sol/luna trio,
+/// the 5.6 sol/terra/luna trio and gpt-5.5 (verified answering over a ChatGPT
+/// account on 2026-09-23). Older generations the catalog no longer lists
+/// (gpt-5.4, the *-codex models) are refused; so are hidden catalog entries
+/// (`gpt-reserve`, `codex-auto-review`), which aren't advertised. The bare "gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
 /// model aliases — on both POST endpoints, so a client that picks a bare name
 /// out of this very list reaches the subscription pool whichever wire API it
@@ -442,6 +440,7 @@ const SUPPORTED_MODELS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.6",
+    "gpt-5.5",
 ];
 
 /// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
@@ -2762,12 +2761,12 @@ mod tests {
 
     #[tokio::test]
     async fn retired_generations_are_refused_not_billed() {
-        // gpt-5.5 is what ran on OpenRouter for weeks: the pool 400s it and
-        // the paid chain carried it. It is no longer an accepted model.
+        // Generations the Codex catalog no longer lists: the pool 400s them,
+        // and before the gate a paid provider carrying them served them.
         let pool = start_model_aware_upstream(vec![]).await;
         let fallback = start_model_aware_upstream(vec![]).await;
         let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
-        for model in ["gpt-5.5", "gpt-5.4", "gpt-4o"] {
+        for model in ["gpt-5.4", "gpt-5.2-codex", "gpt-4o"] {
             let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
             let response = app
                 .clone()
