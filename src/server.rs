@@ -1886,10 +1886,10 @@ mod tests {
 
     #[tokio::test]
     async fn aux_endpoints_relay_the_pool_error_instead_of_trying_the_fallback() {
-        let pool = start_fake_upstream(
+        let mut pool = start_fake_upstream(
             StatusCode::TOO_MANY_REQUESTS,
             "application/json",
-            r#"{"error":{"message":"slow down"}}"#,
+            USAGE_LIMIT_429_BODY,
         )
         .await;
         let mut fallback_fake = start_fake_upstream(StatusCode::OK, "application/json", "{}").await;
@@ -1898,15 +1898,27 @@ mod tests {
             vec![fallback_provider_cfg("fb", &fallback_fake.base_url)],
         );
         let response = app
+            .clone()
             .oneshot(post_json(
                 "/v1/responses/compact",
-                r#"{"model":"gpt-5.6-sol","input":[]}"#,
+                r#"{"model":"gpt-5.6-luna","input":[]}"#,
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let _ = pool.recv().await;
+        let _ = pool.rx.recv().await.unwrap();
         assert!(fallback_fake.rx.try_recv().is_err());
+
+        // Not even a quota-shaped 429 there marks the account: the next
+        // /v1/responses still tries the pool before any paid fallback.
+        let _ = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        let tried = pool.rx.try_recv().expect("the pool is tried first");
+        assert_eq!(tried.path, "/codex/responses");
     }
 
     #[tokio::test]

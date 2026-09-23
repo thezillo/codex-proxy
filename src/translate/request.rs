@@ -152,7 +152,7 @@ pub fn build_codex_request(req: &ChatCompletionRequest, defaults: &DefaultsConfi
     // model just because `response_format` is set. `chat_response_format_error`
     // has already refused a request that never says it, as Chat would.
     let system_in_input = format.as_ref().is_some_and(|f| f["type"] == "json_object")
-        && !mentions_json(req.messages.iter().filter(|m| !is_system(m)));
+        && !mentions_json(req.messages.iter().filter(|m| is_input_message(m)));
     let instructions = collect_instructions(req, defaults);
     let input = build_input(req, system_in_input);
     let model = resolve_model(&req.model, defaults);
@@ -267,12 +267,29 @@ fn is_system(m: &ChatMessage) -> bool {
 }
 
 /// Whether any of `messages` says "json", in any case, as OpenAI checks.
+/// Scans the text in place: a long history is never copied for this.
 fn mentions_json<'a>(mut messages: impl Iterator<Item = &'a ChatMessage>) -> bool {
-    messages.any(|m| {
-        m.content
-            .as_ref()
-            .is_some_and(|c| c.as_text().to_ascii_lowercase().contains("json"))
+    fn says_json(text: &str) -> bool {
+        text.as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"json"))
+    }
+    messages.any(|m| match &m.content {
+        Some(MessageContent::Text(text)) => says_json(text),
+        Some(MessageContent::Parts(parts)) => parts
+            .iter()
+            .filter(|p| p.kind == "text")
+            .filter_map(|p| p.text.as_deref())
+            .any(says_json),
+        None => false,
     })
+}
+
+/// Messages that reach the Responses backend as input *messages* — the only
+/// place its JSON-mode check looks. Tool results become
+/// `function_call_output` items and don't count there.
+fn is_input_message(m: &ChatMessage) -> bool {
+    m.role == "user" || m.role == "assistant"
 }
 
 fn collect_instructions(req: &ChatCompletionRequest, defaults: &DefaultsConfig) -> String {
@@ -775,6 +792,30 @@ mod tests {
         let body = build_codex_request(&req, &defaults);
         assert_eq!(body["instructions"], "be terse");
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_mode_ignores_a_tool_result_that_says_json() {
+        // The backend's check reads input messages only; a tool result is a
+        // `function_call_output`, so the system prompt still has to move.
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                { "role": "system", "content": "Answer in JSON." },
+                { "role": "user", "content": "weather?" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "w", "arguments": "{}" }
+                }] },
+                { "role": "tool", "tool_call_id": "c1", "content": "{\"json\":true}" }
+            ],
+            "response_format": { "type": "json_object" }
+        }));
+        let body = build_codex_request(&req, &DefaultsConfig::default());
+        assert_eq!(
+            body["input"][0],
+            json!({ "role": "developer", "content": "Answer in JSON." })
+        );
     }
 
     #[test]

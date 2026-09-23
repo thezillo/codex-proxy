@@ -464,8 +464,12 @@ impl Upstream {
             .await
     }
 
-    /// `forward_responses` for any endpoint — the auxiliary JSON ones get
-    /// the same pool sweep, retries and failover, just a different path.
+    /// `forward_responses` for any endpoint. The auxiliary JSON ones
+    /// (compact, search) go to the one account the sweep would start with
+    /// and relay its answer as is: no sweep, and no cooldown or quota hold.
+    /// Their limits and permissions aren't necessarily the account's, and a
+    /// search 429 or 403 marking the account would push all `/v1/responses`
+    /// traffic onto the paid fallback.
     pub async fn forward(
         &self,
         endpoint: Endpoint,
@@ -489,7 +493,7 @@ impl Upstream {
                 .await
             {
                 Ok(response) => {
-                    if is_account_failure(response.status()) {
+                    if endpoint == Endpoint::Responses && is_account_failure(response.status()) {
                         self.pool[idx].start_cooldown(self.account_cooldown);
                         let (response, quota) = self.classify_rate_limit(&account, response).await;
                         if let Some(hold) = quota {
@@ -519,6 +523,7 @@ impl Upstream {
                         reason: None,
                     });
                 }
+                Err(e) if endpoint != Endpoint::Responses => return Err(e),
                 Err(e) => {
                     // The only failure class with no per-account line of its
                     // own: an HTTP failure logs just above, a transport error

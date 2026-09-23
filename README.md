@@ -225,10 +225,12 @@ in the logs, it's one of these three — the message names which.
 - `POST /v1/responses/compact` — OpenAI's stateless history compaction (JSON
   in, JSON out; the returned `compaction` items go into the next
   `/v1/responses` call as is) — and `POST /v1/alpha/search`, Codex's
-  standalone web search. Both are forwarded to the account pool
+  standalone web search. Both are forwarded to one pool account
   (`upstream.compact_path` / `search_path`) with the same model alias and
   unknown-model gate as `/v1/responses`. Pool only: no `[[fallback]]`
-  provider has these endpoints, so a pool error is relayed as is.
+  provider has these endpoints, so a pool error is relayed as is. They never
+  cool down or quota-hold an account, so a failing search can't push
+  `/v1/responses` onto the paid fallback.
 - `POST /v1/embeddings` — direct to the `[embeddings]` provider (the ChatGPT
   pool has no embeddings API); `model` is mapped through its `model_map` on
   the way out and echoed back as requested on the way in. Answers 404 until
