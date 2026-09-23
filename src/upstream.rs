@@ -100,6 +100,8 @@ pub struct Upstream {
     next: AtomicUsize,
     account_cooldown: Duration,
     responses_url: String,
+    compact_url: String,
+    search_url: String,
     usage_url: String,
     /// `None` = polling disabled (`quota_check_interval_secs = 0`).
     quota_poll_interval: Option<Duration>,
@@ -125,6 +127,27 @@ const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Whole-request timeout for one usage poll. Background work; nothing
 /// waits on it except the next tick.
 const USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Which upstream endpoint a pool request goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    /// `responses_path`: the streaming Responses API.
+    Responses,
+    /// `compact_path`: stateless history compaction (JSON in, JSON out).
+    Compact,
+    /// `search_path`: Codex's standalone web search (JSON in, JSON out).
+    Search,
+}
+
+impl Endpoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Endpoint::Responses => "responses",
+            Endpoint::Compact => "responses/compact",
+            Endpoint::Search => "alpha/search",
+        }
+    }
+}
 
 /// What `forward_responses` produced, plus which pool account served it — so
 /// callers can attribute the request in the access log without `Upstream`
@@ -266,6 +289,8 @@ impl Upstream {
         let base_url = cfg.base_url.trim_end_matches('/');
         let responses_url = format!("{base_url}{}", cfg.responses_path);
         let usage_url = format!("{base_url}{}", cfg.usage_path);
+        let compact_url = format!("{base_url}{}", cfg.compact_path);
+        let search_url = format!("{base_url}{}", cfg.search_path);
         let quota_poll_interval = match cfg.quota_check_interval_secs {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
@@ -295,6 +320,8 @@ impl Upstream {
             next: AtomicUsize::new(0),
             account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
             responses_url,
+            compact_url,
+            search_url,
             usage_url,
             quota_poll_interval,
             originator: cfg.originator.clone(),
@@ -433,6 +460,19 @@ impl Upstream {
         client_headers: &reqwest::header::HeaderMap,
         affinity: Option<u64>,
     ) -> Result<ForwardedResponse, PoolFailure> {
+        self.forward(Endpoint::Responses, body, client_headers, affinity)
+            .await
+    }
+
+    /// `forward_responses` for any endpoint — the auxiliary JSON ones get
+    /// the same pool sweep, retries and failover, just a different path.
+    pub async fn forward(
+        &self,
+        endpoint: Endpoint,
+        body: bytes::Bytes,
+        client_headers: &reqwest::header::HeaderMap,
+        affinity: Option<u64>,
+    ) -> Result<ForwardedResponse, PoolFailure> {
         let pool_len = self.pool.len();
         let mut tried = vec![false; pool_len];
         let mut last_response = None;
@@ -445,7 +485,7 @@ impl Upstream {
             tried[idx] = true;
 
             match self
-                .try_account(&auth_mgr, &account, body.clone(), client_headers)
+                .try_account(endpoint, &auth_mgr, &account, body.clone(), client_headers)
                 .await
             {
                 Ok(response) => {
@@ -681,13 +721,14 @@ impl Upstream {
     /// more on it without those items.
     async fn try_account(
         &self,
+        endpoint: Endpoint,
         auth_mgr: &AuthManager,
         account: &Arc<str>,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
     ) -> Result<reqwest::Response, PoolFailure> {
         let response = self
-            .send_refreshing(auth_mgr, account, body.clone(), client_headers)
+            .send_refreshing(endpoint, auth_mgr, account, body.clone(), client_headers)
             .await?;
         if !replay::may_be_undecryptable(response.status()) {
             return Ok(response);
@@ -708,13 +749,14 @@ impl Upstream {
             dropped,
             "upstream could not decrypt replayed state from another upstream; retrying once without it"
         );
-        self.send_refreshing(auth_mgr, account, stripped, client_headers)
+        self.send_refreshing(endpoint, auth_mgr, account, stripped, client_headers)
             .await
     }
 
     /// Send once, and on a 401 force a token refresh and send once more.
     async fn send_refreshing(
         &self,
+        endpoint: Endpoint,
         auth_mgr: &AuthManager,
         account: &Arc<str>,
         body: bytes::Bytes,
@@ -728,7 +770,7 @@ impl Upstream {
             .await
             .map_err(|e| PoolFailure::new(FailureReason::Auth, Some(account.clone()), e))?;
         let response = self
-            .send_once(&auth, body.clone(), client_headers, account)
+            .send_once(endpoint, &auth, body.clone(), client_headers, account)
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -739,7 +781,7 @@ impl Upstream {
             .force_refresh_headers()
             .await
             .map_err(|e| PoolFailure::new(FailureReason::Auth, Some(account.clone()), e))?;
-        self.send_once(&refreshed, body, client_headers, account)
+        self.send_once(endpoint, &refreshed, body, client_headers, account)
             .await
     }
 
@@ -764,15 +806,22 @@ impl Upstream {
 
     async fn send_once(
         &self,
+        endpoint: Endpoint,
         auth: &crate::auth::AuthHeaders,
         body: bytes::Bytes,
         client_headers: &reqwest::header::HeaderMap,
         account: &Arc<str>,
     ) -> Result<reqwest::Response, PoolFailure> {
+        let (url, accept) = match endpoint {
+            Endpoint::Responses => (&self.responses_url, "text/event-stream"),
+            // Both answer one JSON document, not a stream.
+            Endpoint::Compact => (&self.compact_url, "application/json"),
+            Endpoint::Search => (&self.search_url, "application/json"),
+        };
         let mut req = self
-            .identity_headers(self.http.post(&self.responses_url), auth)
+            .identity_headers(self.http.post(url), auth)
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
+            .header("Accept", accept)
             .body(body);
 
         for name in SESSION_IDENTITY_HEADERS {
@@ -797,11 +846,12 @@ impl Upstream {
             // No CompletionLog reaches emit() on this path — attribute the
             // failure here or a transport error becomes invisible to
             // per-account rate-limit debugging.
-            tracing::warn!(%account, error = %e, "forward to responses failed");
+            let target = endpoint.as_str();
+            tracing::warn!(%account, error = %e, "forward to {target} failed");
             PoolFailure::new(
                 FailureReason::from_transport(e.is_timeout(), e.is_connect()),
                 Some(account.clone()),
-                ProxyError::Upstream(format!("forward to responses failed: {e}")),
+                ProxyError::Upstream(format!("forward to {target} failed: {e}")),
             )
         })
     }

@@ -26,6 +26,11 @@ pub struct ChatCompletionRequest {
     /// routing that this key doesn't.
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    /// Structured output (`json_object` / `json_schema`), re-shaped into the
+    /// Responses API's `text.format`. Without this field serde dropped it
+    /// silently and a client asking for a schema got free-form text back.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

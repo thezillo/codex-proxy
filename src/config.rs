@@ -178,6 +178,11 @@ pub struct UpstreamConfig {
     /// quota poller queries. Internal/undocumented, but the real Codex CLI
     /// calls it too (for `/status`), so hitting it is not a fingerprint.
     pub usage_path: String,
+    /// Paths (appended to `base_url`) of the two auxiliary JSON endpoints,
+    /// served here as `/v1/responses/compact` and `/v1/alpha/search`. The
+    /// ChatGPT backend serves them next to `responses_path`, under `/codex`.
+    pub compact_path: String,
+    pub search_path: String,
     /// Quota-aware account state. A 429 whose body says
     /// `usage_limit_reached` is not a transient throttle: it's a hard limit
     /// with a known reset time (hours for the 5h window, days for the
@@ -327,6 +332,8 @@ impl Default for UpstreamConfig {
             proxy: None,
             account_cooldown_secs: 30,
             usage_path: "/wham/usage".to_string(),
+            compact_path: "/codex/responses/compact".to_string(),
+            search_path: "/codex/alpha/search".to_string(),
             quota_check_interval_secs: 600,
         }
     }

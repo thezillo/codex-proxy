@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.7", features = ["json", "ws"] }
 # TLS fingerprint parity with the real Codex Desktop client (per the icebear
 # codex-proxy reverse-engineering): reqwest 0.12.28 + rustls pinned to =0.23.36
 # (its ClientHello changed in 0.23.37), native roots, http2 (ALPN h2), and the
@@ -42,6 +42,9 @@ prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# WebSocket client for the /v1/responses socket tests; the version axum's
+# `ws` feature already resolves, so nothing new is built.
+tokio-tungstenite = "0.24"
 
 [profile.release]
 opt-level = "z"

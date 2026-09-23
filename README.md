@@ -162,6 +162,8 @@ request_timeout_secs = 600
 connect_timeout_secs = 30
 account_cooldown_secs = 30      # skip a failed pool account this long
 usage_path = "/wham/usage"      # ChatGPT usage endpoint the quota poller reads
+compact_path = "/codex/responses/compact"  # upstream of /v1/responses/compact
+search_path = "/codex/alpha/search"        # upstream of /v1/alpha/search
 quota_check_interval_secs = 600 # re-check quota-exhausted accounts; 0 = off
 # [upstream.account_names]      # label pool accounts in logs, by dir basename
 
@@ -205,11 +207,29 @@ in the logs, it's one of these three — the message names which.
 ## Endpoints
 
 - `POST /v1/chat/completions` — Chat Completions, translated to/from Codex Responses (stream or buffered).
+  `response_format` (`json_object` / `json_schema`) becomes the Responses
+  `text.format`, so structured output works through the translation too.
+  JSON mode follows OpenAI Chat, not the Responses backend: "json" in any
+  message, the system prompt included, is enough, and a request that never
+  says it gets OpenAI's own 400 (`'messages' must contain the word 'json'…`).
+  The backend only looks at `input`, so when only the system prompt says it,
+  those system messages are sent as `developer` input items rather than
+  `instructions`.
 - `POST /v1/responses` — passthrough to the Codex Responses API. Forwarded
   byte-for-byte, with one exception: a `model` that `[defaults.model_aliases]`
   maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /
   `gpt-5.6` would otherwise 400 upstream and fall through to a paid provider.
   A body that needs no rewrite is never even parsed into a JSON tree.
+- `GET /v1/responses` (WebSocket upgrade) — the same endpoint over the
+  transport Codex uses when its provider has `supports_websockets`. See
+  [Codex over WebSocket](#codex-over-websocket).
+- `POST /v1/responses/compact` — OpenAI's stateless history compaction (JSON
+  in, JSON out; the returned `compaction` items go into the next
+  `/v1/responses` call as is) — and `POST /v1/alpha/search`, Codex's
+  standalone web search. Both are forwarded to the account pool
+  (`upstream.compact_path` / `search_path`) with the same model alias and
+  unknown-model gate as `/v1/responses`. Pool only: no `[[fallback]]`
+  provider has these endpoints, so a pool error is relayed as is.
 - `POST /v1/embeddings` — direct to the `[embeddings]` provider (the ChatGPT
   pool has no embeddings API); `model` is mapped through its `model_map` on
   the way out and echoed back as requested on the way in. Answers 404 until
@@ -234,6 +254,41 @@ original status and body.
 lose session continuity. `x-codex-turn-state` only gets relayed when there's
 exactly one pool account — with multiple accounts it's tied to whichever one
 issued it, so it's dropped instead of replayed against the wrong account.
+
+## Codex over WebSocket
+
+The Codex CLI only calls two of the endpoints above when its provider
+declares it can serve them. For a custom provider:
+
+```toml
+[model_providers.proxy]
+name = "codex-proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+env_key = "CODEX_PROXY_KEY"
+supports_websockets = true              # GET /v1/responses (WebSocket)
+supports_standalone_web_search = true   # POST /v1/alpha/search
+```
+
+The built-in `openai` provider, pointed here with `openai_base_url`, turns
+on both flags by itself (and, in CLIs up to 0.14x, also compacts through
+`/v1/responses/compact`; newer ones compact through `/v1/responses`).
+
+On the socket, each `response.create` frame is forwarded as an ordinary
+`/v1/responses` request. It goes through the same pool, downgrades and fallback
+chain, and each upstream SSE event comes back as one text frame. The upstream
+side is plain HTTP, as before, so the TLS fingerprint doesn't change. Codex
+sends a follow-up turn as `previous_response_id` plus only the new input items.
+The proxy keeps the previous request's input and output items for the
+connection and rebuilds the full input before forwarding. A
+`previous_response_id` from anywhere else gets `previous_response_not_found`,
+and Codex answers that by resending the whole request. Warm-up frames
+(`generate: false`) are answered locally, without a model call. Requests on
+the socket are logged and counted under `endpoint="/v1/responses (ws)"`.
+
+Memory cost: each open socket keeps the text of its last request's input, up
+to `max_body_bytes` for a long session. Count one such body per concurrent
+Codex session on top of the bodies in flight when you size `--memory`.
 
 ## Logging & token usage
 

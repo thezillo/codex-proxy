@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::DefaultsConfig;
-use crate::translate::openai::{ChatCompletionRequest, ImageUrl, MessageContent};
+use crate::translate::openai::{ChatCompletionRequest, ChatMessage, ImageUrl, MessageContent};
 
 /// Read just the `model` field of a Responses body. Deserializing into a
 /// one-field struct walks the JSON but builds no tree — serde skips every
@@ -137,8 +137,26 @@ fn key_precedes(body: &[u8], at: usize) -> bool {
 /// Build the Codex Responses request body. We always request `stream: true`
 /// upstream and adapt to the client's streaming preference ourselves.
 pub fn build_codex_request(req: &ChatCompletionRequest, defaults: &DefaultsConfig) -> Value {
-    let instructions = collect_instructions(req, defaults);
-    let input = build_input(req);
+    let format = req
+        .response_format
+        .as_ref()
+        .and_then(convert_response_format);
+    // JSON mode: Chat accepts "json" anywhere in `messages`, the system
+    // prompt included — where clients usually write it. The Responses
+    // backend only looks at `input` (400 "Response input messages must
+    // contain the word 'json'"), and the system prompt normally becomes
+    // `instructions`. So when only the system prompt says it, the client's
+    // system messages go into `input` instead, as `developer` items — their
+    // own words, at their own positions. `chat_json_mode_error` has already
+    // refused a request that never says it, as Chat would.
+    let system_in_input = format.as_ref().is_some_and(|f| f["type"] == "json_object")
+        && !mentions_json(req.messages.iter().filter(|m| !is_system(m)));
+    let instructions = if system_in_input {
+        defaults.instructions.clone()
+    } else {
+        collect_instructions(req, defaults)
+    };
+    let input = build_input(req, system_in_input);
     let model = resolve_model(&req.model, defaults);
 
     let mut body = json!({
@@ -165,6 +183,10 @@ pub fn build_codex_request(req: &ChatCompletionRequest, defaults: &DefaultsConfi
 
     if let Some(key) = req.prompt_cache_key.as_ref().filter(|k| !k.is_empty()) {
         obj.insert("prompt_cache_key".into(), Value::String(key.clone()));
+    }
+
+    if let Some(format) = format {
+        obj.insert("text".into(), json!({ "format": format }));
     }
 
     // Reasoning: request field overrides the configured default.
@@ -194,11 +216,39 @@ fn resolve_model(requested: &str, defaults: &DefaultsConfig) -> String {
     }
 }
 
+/// OpenAI Chat's own refusal of JSON mode without the word "json" in any
+/// message, reproduced here so a client sees exactly what OpenAI would send:
+/// `Some(message)` for a 400 `invalid_request_error` on `param: "messages"`.
+/// Without the instruction the model may stream whitespace until the token
+/// limit, which is why OpenAI refuses it rather than guessing.
+pub fn chat_json_mode_error(req: &ChatCompletionRequest) -> Option<&'static str> {
+    let rf = req.response_format.as_ref()?;
+    if rf.get("type").and_then(Value::as_str) != Some("json_object")
+        || mentions_json(req.messages.iter())
+    {
+        return None;
+    }
+    Some("'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.")
+}
+
+fn is_system(m: &ChatMessage) -> bool {
+    m.role == "system" || m.role == "developer"
+}
+
+/// Whether any of `messages` says "json", in any case, as OpenAI checks.
+fn mentions_json<'a>(mut messages: impl Iterator<Item = &'a ChatMessage>) -> bool {
+    messages.any(|m| {
+        m.content
+            .as_ref()
+            .is_some_and(|c| c.as_text().to_ascii_lowercase().contains("json"))
+    })
+}
+
 fn collect_instructions(req: &ChatCompletionRequest, defaults: &DefaultsConfig) -> String {
     let system: Vec<String> = req
         .messages
         .iter()
-        .filter(|m| m.role == "system" || m.role == "developer")
+        .filter(|m| is_system(m))
         .filter_map(|m| m.content.as_ref().map(|c| c.as_text()))
         .filter(|s| !s.is_empty())
         .collect();
@@ -210,11 +260,23 @@ fn collect_instructions(req: &ChatCompletionRequest, defaults: &DefaultsConfig) 
     }
 }
 
-fn build_input(req: &ChatCompletionRequest) -> Value {
+/// `system_in_input`: carry system/developer messages as `developer` input
+/// items rather than leaving them to `instructions` (see JSON mode above).
+fn build_input(req: &ChatCompletionRequest, system_in_input: bool) -> Value {
     let mut input: Vec<Value> = Vec::new();
 
     for msg in &req.messages {
         match msg.role.as_str() {
+            "system" | "developer" if system_in_input => {
+                let text = msg
+                    .content
+                    .as_ref()
+                    .map(|c| c.as_text())
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    input.push(json!({ "role": "developer", "content": text }));
+                }
+            }
             "system" | "developer" => continue,
 
             "assistant" => {
@@ -312,6 +374,30 @@ fn user_content(content: Option<&MessageContent>) -> Value {
             }
             Value::Array(out)
         }
+    }
+}
+
+/// Chat Completions `response_format` -> Responses `text.format`. Chat nests
+/// the schema one level down (`json_schema: {name, schema, strict}`); the
+/// Responses form is flat — the shape the Codex CLI itself sends for
+/// `--output-schema`. `text` (the default) and anything unrecognized map to
+/// nothing: omitting the field is what "no structured output" means upstream.
+fn convert_response_format(rf: &Value) -> Option<Value> {
+    match rf.get("type").and_then(Value::as_str)? {
+        "json_object" => Some(json!({ "type": "json_object" })),
+        "json_schema" => {
+            let spec = rf.get("json_schema")?;
+            let mut format = json!({
+                "type": "json_schema",
+                "name": spec.get("name").cloned().unwrap_or_else(|| json!("response")),
+                "schema": spec.get("schema").cloned().unwrap_or_else(|| json!({})),
+            });
+            if let Some(strict) = spec.get("strict").and_then(Value::as_bool) {
+                format["strict"] = Value::Bool(strict);
+            }
+            Some(format)
+        }
+        _ => None,
     }
 }
 
@@ -594,5 +680,101 @@ mod tests {
             convert_tool_choice(&json!({ "type": "function", "function": { "name": "f" } })),
             json!({ "type": "function", "name": "f" })
         );
+    }
+
+    #[test]
+    fn response_format_becomes_text_format() {
+        let schema = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": schema, "strict": true }
+            }
+        }));
+        let body = build_codex_request(&req, &DefaultsConfig::default());
+        assert_eq!(
+            body["text"],
+            json!({ "format": { "type": "json_schema", "name": "answer", "schema": schema, "strict": true } })
+        );
+
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "json_object" }
+        }));
+        let body = build_codex_request(&req, &DefaultsConfig::default());
+        assert_eq!(body["text"], json!({ "format": { "type": "json_object" } }));
+    }
+
+    #[test]
+    fn json_mode_moves_the_clients_own_system_prompt_into_the_input() {
+        // Live upstream: 400 "Response input messages must contain the word
+        // 'json'" — `instructions` doesn't count, but Chat counts the system
+        // prompt. The client's own words move; nothing is invented.
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                { "role": "system", "content": "Reply in JSON." },
+                { "role": "user", "content": "largest planet?" }
+            ],
+            "response_format": { "type": "json_object" }
+        }));
+        assert_eq!(chat_json_mode_error(&req), None);
+        let defaults = DefaultsConfig::default();
+        let body = build_codex_request(&req, &defaults);
+        assert_eq!(
+            body["input"][0],
+            json!({ "role": "developer", "content": "Reply in JSON." })
+        );
+        assert_eq!(body["input"][1]["content"], "largest planet?");
+        assert_eq!(body["instructions"], defaults.instructions);
+
+        // The user already says it: the system prompt stays `instructions`.
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": "answer as json" }
+            ],
+            "response_format": { "type": "json_object" }
+        }));
+        let body = build_codex_request(&req, &defaults);
+        assert_eq!(body["instructions"], "be terse");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_mode_without_the_word_json_is_refused_like_openai_chat() {
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "largest planet?" }],
+            "response_format": { "type": "json_object" }
+        }));
+        assert!(chat_json_mode_error(&req)
+            .unwrap()
+            .contains("must contain the word 'json'"));
+
+        // json_schema carries no such rule.
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "largest planet?" }],
+            "response_format": { "type": "json_schema", "json_schema": { "name": "x", "schema": {} } }
+        }));
+        assert_eq!(chat_json_mode_error(&req), None);
+    }
+
+    #[test]
+    fn plain_text_response_format_sends_no_text_field() {
+        for rf in [json!({ "type": "text" }), json!({ "type": "json_schema" })] {
+            let req = parse(json!({
+                "model": "gpt-6-astra",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "response_format": rf
+            }));
+            let body = build_codex_request(&req, &DefaultsConfig::default());
+            assert!(body.get("text").is_none(), "{rf}");
+        }
     }
 }
