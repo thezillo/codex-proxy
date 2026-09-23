@@ -98,6 +98,11 @@ account_cooldown_secs = 30
 # polling (the state then clears only when the reported reset passes).
 usage_path = "/wham/usage"
 quota_check_interval_secs = 600
+# Upstream targets of /v1/responses/compact (OpenAI's stateless history
+# compaction) and /v1/alpha/search (Codex's standalone web search).
+# Pool-only: no fallback.
+compact_path = "/codex/responses/compact"
+search_path = "/codex/alpha/search"
 
 # Defaults applied to /v1/chat/completions when the client omits a field.
 [defaults]

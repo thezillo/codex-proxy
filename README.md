@@ -162,6 +162,8 @@ request_timeout_secs = 600
 connect_timeout_secs = 30
 account_cooldown_secs = 30      # skip a failed pool account this long
 usage_path = "/wham/usage"      # ChatGPT usage endpoint the quota poller reads
+compact_path = "/codex/responses/compact"  # upstream of /v1/responses/compact
+search_path = "/codex/alpha/search"        # upstream of /v1/alpha/search
 quota_check_interval_secs = 600 # re-check quota-exhausted accounts; 0 = off
 # [upstream.account_names]      # label pool accounts in logs, by dir basename
 
@@ -205,11 +207,30 @@ in the logs, it's one of these three — the message names which.
 ## Endpoints
 
 - `POST /v1/chat/completions` — Chat Completions, translated to/from Codex Responses (stream or buffered).
+  `response_format` (`json_object` / `json_schema`) becomes the Responses
+  `text.format`, so structured output works through the translation too.
+  JSON mode follows OpenAI Chat, not the Responses backend: "json" in any
+  message, the system prompt included, is enough, and a request that never
+  says it gets OpenAI's own 400 (`'messages' must contain the word 'json'…`).
+  The backend only looks at `input`, so when only the system prompt says it,
+  those system messages are also sent as `developer` input items (they stay
+  `instructions` too, so the configured default never replaces them). A
+  `response_format` OpenAI would refuse (unknown `type`, `json_schema`
+  without its object or `name`) gets OpenAI's 400 too.
 - `POST /v1/responses` — passthrough to the Codex Responses API. Forwarded
   byte-for-byte, with one exception: a `model` that `[defaults.model_aliases]`
   maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /
   `gpt-5.6` would otherwise 400 upstream and fall through to a paid provider.
   A body that needs no rewrite is never even parsed into a JSON tree.
+- `POST /v1/responses/compact` — OpenAI's stateless history compaction (JSON
+  in, JSON out; the returned `compaction` items go into the next
+  `/v1/responses` call as is) — and `POST /v1/alpha/search`, Codex's
+  standalone web search. Both are forwarded to one pool account
+  (`upstream.compact_path` / `search_path`) with the same model alias and
+  unknown-model gate as `/v1/responses`. Pool only: no `[[fallback]]`
+  provider has these endpoints, so a pool error is relayed as is. They never
+  cool down or quota-hold an account, so a failing search can't push
+  `/v1/responses` onto the paid fallback.
 - `POST /v1/embeddings` — direct to the `[embeddings]` provider (the ChatGPT
   pool has no embeddings API); `model` is mapped through its `model_map` on
   the way out and echoed back as requested on the way in. Answers 404 until
@@ -234,6 +255,23 @@ original status and body.
 lose session continuity. `x-codex-turn-state` only gets relayed when there's
 exactly one pool account — with multiple accounts it's tied to whichever one
 issued it, so it's dropped instead of replayed against the wrong account.
+
+## Codex standalone web search
+
+The Codex CLI only calls `/v1/alpha/search` when its provider declares it.
+For a custom provider:
+
+```toml
+[model_providers.proxy]
+name = "codex-proxy"
+base_url = "https://proxy.example.com/v1"
+wire_api = "responses"
+env_key = "CODEX_PROXY_KEY"
+supports_standalone_web_search = true   # POST /v1/alpha/search
+```
+
+Leave `supports_websockets` off: the proxy serves `/v1/responses` over HTTP
+only.
 
 ## Logging & token usage
 

@@ -27,6 +27,11 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
+    /// The HTTP status this error answers with.
+    pub fn status(&self) -> StatusCode {
+        self.parts().0
+    }
+
     fn parts(&self) -> (StatusCode, &'static str) {
         match self {
             ProxyError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),

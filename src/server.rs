@@ -26,10 +26,10 @@ use crate::fallback::FallbackChain;
 use crate::metrics::{Metrics, TokenUsage};
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
-    alias_responses_model, build_codex_request, collect_chat, model_of, rewrite_model, stream_chat,
-    tee_responses, ChatCompletionRequest,
+    alias_responses_model, build_codex_request, chat_response_format_error, collect_chat, model_of,
+    rewrite_model, stream_chat, tee_responses, ChatCompletionRequest,
 };
-use crate::upstream::{FailureReason, ForwardedResponse, Upstream};
+use crate::upstream::{Endpoint, FailureReason, ForwardedResponse, Upstream};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -351,6 +351,14 @@ pub fn router(state: AppState) -> Router {
             post(responses).route_layer(auth_layer.clone()),
         )
         .route(
+            "/v1/responses/compact",
+            post(responses_compact).route_layer(auth_layer.clone()),
+        )
+        .route(
+            "/v1/alpha/search",
+            post(alpha_search).route_layer(auth_layer.clone()),
+        )
+        .route(
             EMBEDDINGS_ENDPOINT,
             post(embeddings).route_layer(auth_layer.clone()),
         )
@@ -561,19 +569,127 @@ async fn responses(
     // gzip/br/zstd decoding may or may not strip `Content-Encoding` from an
     // encoded upstream response, and blindly relaying it over an
     // already-decoded body would corrupt it for the client either way.
-    let out_headers = response.headers_mut();
-    let content_type = upstream_headers
+    copy_relayed_headers(&upstream_headers, response.headers_mut());
+
+    Ok(response)
+}
+
+/// `/v1/responses/compact`: OpenAI's public, stateless history compaction
+/// (JSON in, JSON out; the `compaction` items it returns go into the next
+/// `/v1/responses` call as is). Older Codex CLIs also call it for an
+/// `openai`-named provider; 0.155+ compact through `/v1/responses` instead.
+async fn responses_compact(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, ProxyError> {
+    forward_aux_json(
+        &state,
+        ctx,
+        &headers,
+        body,
+        Endpoint::Compact,
+        "/v1/responses/compact",
+    )
+    .await
+}
+
+/// `/v1/alpha/search`: the Codex CLI's standalone web search tool, sent for
+/// a provider with `supports_standalone_web_search = true` (or `openai`).
+async fn alpha_search(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AccessCtx>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, ProxyError> {
+    forward_aux_json(
+        &state,
+        ctx,
+        &headers,
+        body,
+        Endpoint::Search,
+        "/v1/alpha/search",
+    )
+    .await
+}
+
+/// Shared passthrough for the auxiliary JSON endpoints: the same alias and
+/// unknown-model gates as `/v1/responses`, then the pool — and ONLY the pool.
+/// `[[fallback]]` providers speak plain Responses; neither OpenRouter nor
+/// Azure has these paths, so a fallback attempt would just trade the pool's
+/// real error for a 404. The body streams back verbatim (no size cap needed:
+/// nothing is buffered).
+async fn forward_aux_json(
+    state: &AppState,
+    ctx: AccessCtx,
+    headers: &HeaderMap,
+    body: bytes::Bytes,
+    endpoint: Endpoint,
+    path: &'static str,
+) -> Result<Response, ProxyError> {
+    let body = match alias_responses_model(&body, &state.config.defaults) {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => body,
+    };
+    let info = affinity::inspect(&body);
+    if let Some(m) = &info.model {
+        if let Some(rejection) = reject_unknown_model(state, &ctx, m) {
+            return Ok(rejection);
+        }
+    }
+    let model = info.model.clone().unwrap_or_else(|| "-".into());
+    let metric_model = metric_model_label(&model).to_string();
+    let key = affinity::resolve(headers, info.key);
+    let mut log = CompletionLog::new(ctx, path, model, metric_model, state.metrics.clone());
+    let fwd = match state
+        .upstream
+        .forward(endpoint, body, headers, key.as_ref().map(|k| k.hash))
+        .await
+    {
+        Ok(fwd) => fwd,
+        Err(failure) => {
+            if let Some(account) = failure.account.clone() {
+                log.set_account(account);
+            }
+            log.emit(failure.error.status().as_u16(), None);
+            return Err(failure.into());
+        }
+    };
+    log.set_account(fwd.account);
+    if let Some(key) = &key {
+        log.set_affinity(key.source.as_str());
+    }
+    let upstream = fwd.response;
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Neither endpoint reports token usage in a shape worth parsing; the
+    // line still records who called what, on which account, with what result.
+    log.emit(status.as_u16(), None);
+    let upstream_headers = upstream.headers().clone();
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|e| {
+            ProxyError::Internal(format!("failed to build response: {e}")).into_response()
+        });
+    copy_relayed_headers(&upstream_headers, response.headers_mut());
+    Ok(response)
+}
+
+/// Content-Type plus the Codex session-continuity headers, the only upstream
+/// response headers relayed (see `responses` for why it's an allowlist).
+fn copy_relayed_headers(upstream: &reqwest::header::HeaderMap, out: &mut HeaderMap) {
+    let content_type = upstream
         .get(axum::http::header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
-    out_headers.insert(axum::http::header::CONTENT_TYPE, content_type);
+    out.insert(axum::http::header::CONTENT_TYPE, content_type);
     for name in crate::upstream::CODEX_SESSION_RESPONSE_HEADERS {
-        if let Some(value) = upstream_headers.get(*name) {
-            out_headers.insert(axum::http::HeaderName::from_static(name), value.clone());
+        if let Some(value) = upstream.get(*name) {
+            out.insert(axum::http::HeaderName::from_static(name), value.clone());
         }
     }
-
-    Ok(response)
 }
 
 /// OpenAI-compatible `/v1/chat/completions`: translate to the Responses API,
@@ -597,6 +713,21 @@ async fn chat_completions(
         state.metrics.clone(),
     );
 
+    if let Some((message, param, code)) = chat_response_format_error(&req) {
+        log.emit(StatusCode::BAD_REQUEST.as_u16(), None);
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": param,
+                    "code": code,
+                }
+            })),
+        )
+            .into_response());
+    }
     let codex_body = build_codex_request(&req, &defaults);
     // Checked after alias resolution: `gpt-6` is fine because it becomes
     // `gpt-6-astra`; `gpt-5.2-codex` is not, whatever it's called.
@@ -1605,6 +1736,7 @@ mod tests {
     }
 
     struct CapturedUpstreamRequest {
+        path: String,
         authorization: Option<String>,
         account_id: Option<String>,
         originator: Option<String>,
@@ -1633,6 +1765,9 @@ mod tests {
         let app = Router::new()
             .route("/codex/responses", post(fake_responses))
             .route("/responses", post(fake_responses))
+            // The pool's auxiliary JSON endpoints.
+            .route("/codex/responses/compact", post(fake_responses))
+            .route("/codex/alpha/search", post(fake_responses))
             // ...and the `[embeddings]` default path, so it can also stand in
             // for the direct embeddings provider.
             .route("/embeddings", post(fake_responses))
@@ -1651,6 +1786,7 @@ mod tests {
 
     async fn fake_responses(
         axum::extract::State(state): axum::extract::State<FakeUpstreamState>,
+        uri: axum::http::Uri,
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
@@ -1661,6 +1797,7 @@ mod tests {
                 .map(str::to_string)
         };
         let captured = CapturedUpstreamRequest {
+            path: uri.path().to_string(),
             authorization: header("authorization"),
             account_id: header("chatgpt-account-id"),
             originator: header("originator"),
@@ -1690,6 +1827,98 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    fn post_json(uri: &'static str, body: &'static str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", "Bearer test-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compact_and_search_reach_their_own_pool_paths() {
+        for (uri, upstream_path) in [
+            ("/v1/responses/compact", "/codex/responses/compact"),
+            ("/v1/alpha/search", "/codex/alpha/search"),
+        ] {
+            let pool =
+                start_fake_upstream(StatusCode::OK, "application/json", r#"{"output":[]}"#).await;
+            let app = test_router_with_upstream(1024 * 1024, pool.base_url.clone());
+
+            let response = app
+                .oneshot(post_json(uri, r#"{"model":"gpt-5.6","input":[]}"#))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()["x-codex-turn-state"],
+                "server-issued-token",
+                "{uri}"
+            );
+            assert_eq!(body_string(response).await, r#"{"output":[]}"#, "{uri}");
+
+            let captured = pool.recv().await;
+            assert_eq!(captured.path, upstream_path);
+            // JSON in, JSON out: not the SSE `Accept` of /responses.
+            assert_eq!(captured.accept.as_deref(), Some("application/json"));
+            assert!(captured
+                .authorization
+                .is_some_and(|a| a.starts_with("Bearer ") && a != "Bearer test-key"));
+            let forwarded: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+            assert_eq!(forwarded["model"], "gpt-5.6-sol", "alias applied on {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aux_endpoints_gate_unknown_models() {
+        let pool = start_fake_upstream(StatusCode::OK, "application/json", "{}").await;
+        let app = test_router_with_upstream(1024 * 1024, pool.base_url.clone());
+        let response = app
+            .oneshot(post_json("/v1/alpha/search", r#"{"model":"gpt-4o"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn aux_endpoints_relay_the_pool_error_instead_of_trying_the_fallback() {
+        let mut pool = start_fake_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            USAGE_LIMIT_429_BODY,
+        )
+        .await;
+        let mut fallback_fake = start_fake_upstream(StatusCode::OK, "application/json", "{}").await;
+        let app = test_router_with_fallback(
+            pool.base_url.clone(),
+            vec![fallback_provider_cfg("fb", &fallback_fake.base_url)],
+        );
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/v1/responses/compact",
+                r#"{"model":"gpt-5.6-luna","input":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = pool.rx.recv().await.unwrap();
+        assert!(fallback_fake.rx.try_recv().is_err());
+
+        // Not even a quota-shaped 429 there marks the account: the next
+        // /v1/responses still tries the pool before any paid fallback.
+        let _ = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        let tried = pool.rx.try_recv().expect("the pool is tried first");
+        assert_eq!(tried.path, "/codex/responses");
     }
 
     #[tokio::test]
