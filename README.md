@@ -222,9 +222,6 @@ in the logs, it's one of these three — the message names which.
   maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /
   `gpt-5.6` would otherwise 400 upstream and fall through to a paid provider.
   A body that needs no rewrite is never even parsed into a JSON tree.
-- `GET /v1/responses` (WebSocket upgrade) — the same endpoint over the
-  transport Codex uses when its provider has `supports_websockets`. See
-  [Codex over WebSocket](#codex-over-websocket).
 - `POST /v1/responses/compact` — OpenAI's stateless history compaction (JSON
   in, JSON out; the returned `compaction` items go into the next
   `/v1/responses` call as is) — and `POST /v1/alpha/search`, Codex's
@@ -257,10 +254,10 @@ lose session continuity. `x-codex-turn-state` only gets relayed when there's
 exactly one pool account — with multiple accounts it's tied to whichever one
 issued it, so it's dropped instead of replayed against the wrong account.
 
-## Codex over WebSocket
+## Codex standalone web search
 
-The Codex CLI only calls two of the endpoints above when its provider
-declares it can serve them. For a custom provider:
+The Codex CLI only calls `/v1/alpha/search` when its provider declares it.
+For a custom provider:
 
 ```toml
 [model_providers.proxy]
@@ -268,29 +265,11 @@ name = "codex-proxy"
 base_url = "https://proxy.example.com/v1"
 wire_api = "responses"
 env_key = "CODEX_PROXY_KEY"
-supports_websockets = true              # GET /v1/responses (WebSocket)
 supports_standalone_web_search = true   # POST /v1/alpha/search
 ```
 
-The built-in `openai` provider, pointed here with `openai_base_url`, turns
-on both flags by itself (and, in CLIs up to 0.14x, also compacts through
-`/v1/responses/compact`; newer ones compact through `/v1/responses`).
-
-On the socket, each `response.create` frame is forwarded as an ordinary
-`/v1/responses` request. It goes through the same pool, downgrades and fallback
-chain, and each upstream SSE event comes back as one text frame. The upstream
-side is plain HTTP, as before, so the TLS fingerprint doesn't change. Codex
-sends a follow-up turn as `previous_response_id` plus only the new input items.
-The proxy keeps the previous request's input and output items for the
-connection and rebuilds the full input before forwarding. A
-`previous_response_id` from anywhere else gets `previous_response_not_found`,
-and Codex answers that by resending the whole request. Warm-up frames
-(`generate: false`) are answered locally, without a model call. Requests on
-the socket are logged and counted under `endpoint="/v1/responses (ws)"`.
-
-Memory cost: each open socket keeps the text of its last request's input, up
-to `max_body_bytes` for a long session. Count one such body per concurrent
-Codex session on top of the bodies in flight when you size `--memory`.
+Leave `supports_websockets` off: the proxy serves `/v1/responses` over HTTP
+only.
 
 ## Logging & token usage
 

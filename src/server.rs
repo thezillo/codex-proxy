@@ -348,10 +348,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models/:model", get(model_by_id))
         .route(
             "/v1/responses",
-            // GET is the WebSocket upgrade (see `crate::ws`).
-            post(responses)
-                .get(crate::ws::upgrade)
-                .route_layer(auth_layer.clone()),
+            post(responses).route_layer(auth_layer.clone()),
         )
         .route(
             "/v1/responses/compact",
@@ -517,10 +514,30 @@ async fn responses(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
-    let (fwd, log) = match dispatch_responses(&state, ctx, &headers, body, "/v1/responses").await? {
-        Dispatched::Rejected(response) => return Ok(response),
-        Dispatched::Forwarded(fwd, log) => (fwd, log),
+    // Codex uses this endpoint, so the model alias map has to be applied here
+    // too — otherwise a bare `gpt-6`/`gpt-5.6` (both advertised by /v1/models)
+    // 400s upstream and the request silently lands on the paid fallback. The
+    // body is only rebuilt when an alias actually fires; every other request
+    // is still forwarded byte-for-byte.
+    let body = match alias_responses_model(&body, &state.config.defaults) {
+        Some(rewritten) => bytes::Bytes::from(rewritten),
+        None => body,
     };
+    // A second scan of the body (the alias check did one), borrowing the big
+    // fields as raw JSON rather than building a tree: the model, plus what
+    // the conversation key is made of. A model of `None` (not JSON, no string
+    // model) is left for the upstream to judge, as before. The body itself
+    // is still forwarded byte-for-byte to the pool.
+    let info = affinity::inspect(&body);
+    if let Some(m) = &info.model {
+        if let Some(rejection) = reject_unknown_model(&state, &ctx, m) {
+            return Ok(rejection);
+        }
+    }
+    let key = affinity::resolve(&headers, info.key);
+    let fwd = state
+        .forward_with_fallback(body, &headers, &ctx, info.model.as_deref(), key.as_ref())
+        .await?;
     let upstream = fwd.response;
 
     let status =
@@ -529,7 +546,13 @@ async fn responses(
     let upstream_headers = upstream.headers().clone();
 
     // Forward verbatim, but tee the SSE for token usage so this passthrough —
-    // the path the real Codex CLI uses — is attributed too.
+    // the path the real Codex CLI uses — is attributed too. Model isn't parsed
+    // here (the body may be many MB); `-` marks "raw passthrough".
+    let mut log = CompletionLog::new(ctx, "/v1/responses", "-", "-", state.metrics.clone());
+    log.set_account(fwd.account);
+    if let Some(key) = &key {
+        log.set_affinity(key.source.as_str());
+    }
     let stream = tee_responses(upstream, log, state.config.server.max_body_bytes);
 
     let mut response = Response::builder()
@@ -549,60 +572,6 @@ async fn responses(
     copy_relayed_headers(&upstream_headers, response.headers_mut());
 
     Ok(response)
-}
-
-/// A Responses request body after the proxy's own gates.
-pub(crate) enum Dispatched {
-    /// Refused here, before any upstream saw it (e.g. an unknown model).
-    Rejected(Response),
-    /// Forwarded; the response is the pool's or a fallback provider's, and
-    /// the log is ready to be emitted once the body has been relayed.
-    Forwarded(ForwardedResponse, CompletionLog),
-}
-
-/// Everything `/v1/responses` does to a body before relaying the answer —
-/// shared by the HTTP route and the WebSocket transport (`crate::ws`), which
-/// differ only in how the answer is framed back to the client.
-pub(crate) async fn dispatch_responses(
-    state: &AppState,
-    ctx: AccessCtx,
-    headers: &HeaderMap,
-    body: bytes::Bytes,
-    endpoint: &'static str,
-) -> Result<Dispatched, ProxyError> {
-    // Codex uses this endpoint, so the model alias map has to be applied here
-    // too — otherwise a bare `gpt-6`/`gpt-5.6` (both advertised by /v1/models)
-    // 400s upstream and the request silently lands on the paid fallback. The
-    // body is only rebuilt when an alias actually fires; every other request
-    // is still forwarded byte-for-byte.
-    let body = match alias_responses_model(&body, &state.config.defaults) {
-        Some(rewritten) => bytes::Bytes::from(rewritten),
-        None => body,
-    };
-    // A second scan of the body (the alias check did one), borrowing the big
-    // fields as raw JSON rather than building a tree: the model, plus what
-    // the conversation key is made of. A model of `None` (not JSON, no string
-    // model) is left for the upstream to judge, as before. The body itself
-    // is still forwarded byte-for-byte to the pool.
-    let info = affinity::inspect(&body);
-    if let Some(m) = &info.model {
-        if let Some(rejection) = reject_unknown_model(state, &ctx, m) {
-            return Ok(Dispatched::Rejected(rejection));
-        }
-    }
-    let key = affinity::resolve(headers, info.key);
-    let fwd = state
-        .forward_with_fallback(body, headers, &ctx, info.model.as_deref(), key.as_ref())
-        .await?;
-
-    // Model isn't parsed here (the body may be many MB); `-` marks "raw
-    // passthrough".
-    let mut log = CompletionLog::new(ctx, endpoint, "-", "-", state.metrics.clone());
-    log.set_account(fwd.account.clone());
-    if let Some(key) = &key {
-        log.set_affinity(key.source.as_str());
-    }
-    Ok(Dispatched::Forwarded(fwd, log))
 }
 
 /// `/v1/responses/compact`: OpenAI's public, stateless history compaction
@@ -3235,304 +3204,6 @@ mod tests {
         for (kind, n) in [("prompt", 1000), ("cached", 800), ("cache_write", 150)] {
             let needle = format!(r#"kind="{kind}",model="-"}} {n}"#);
             assert!(scraped.contains(&needle), "missing {needle} in {scraped}");
-        }
-    }
-
-    // ---- /v1/responses over WebSocket (crate::ws) ----
-
-    const WS_TURN_SSE: &str = concat!(
-        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
-        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
-        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n",
-    );
-
-    type WsClient = tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >;
-
-    async fn serve_on_loopback(app: axum::Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("ws://{addr}/v1/responses")
-    }
-
-    async fn ws_connect(
-        url: &str,
-        key: Option<&str>,
-    ) -> Result<WsClient, tokio_tungstenite::tungstenite::Error> {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut request = url.into_client_request().unwrap();
-        if let Some(key) = key {
-            request
-                .headers_mut()
-                .insert("authorization", format!("Bearer {key}").parse().unwrap());
-        }
-        tokio_tungstenite::connect_async(request)
-            .await
-            .map(|(ws, _)| ws)
-    }
-
-    async fn ws_send(ws: &mut WsClient, frame: serde_json::Value) {
-        use futures_util::SinkExt;
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            frame.to_string(),
-        ))
-        .await
-        .unwrap();
-    }
-
-    /// Frames up to and including the terminal one (`response.completed` or
-    /// `error`).
-    async fn ws_turn(ws: &mut WsClient) -> Vec<serde_json::Value> {
-        use futures_util::StreamExt;
-        let mut frames = Vec::new();
-        loop {
-            let message = ws.next().await.expect("socket open").unwrap();
-            let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
-                continue;
-            };
-            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let kind = frame["type"].as_str().unwrap().to_string();
-            frames.push(frame);
-            if kind == "response.completed" || kind == "error" {
-                return frames;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn ws_relays_events_and_rebuilds_the_input_of_a_continued_turn() {
-        let mut pool = start_fake_upstream(StatusCode::OK, "text/event-stream", WS_TURN_SSE).await;
-        let url = serve_on_loopback(test_router_with_upstream(
-            1024 * 1024,
-            pool.base_url.clone(),
-        ))
-        .await;
-        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
-
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6", "store": false,
-                "input": [{ "role": "user", "content": "hi" }]
-            }),
-        )
-        .await;
-        let frames = ws_turn(&mut ws).await;
-        let kinds: Vec<_> = frames.iter().map(|f| f["type"].as_str().unwrap()).collect();
-        assert_eq!(
-            kinds,
-            [
-                "response.created",
-                "response.output_item.done",
-                "response.completed"
-            ]
-        );
-        let first = pool.rx.recv().await.unwrap();
-        assert_eq!(first.path, "/codex/responses");
-        let first: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
-        assert!(
-            first.get("type").is_none(),
-            "the frame type is not a Responses field"
-        );
-        assert_eq!(first["model"], "gpt-5.6-sol", "alias applied");
-        assert_eq!(first["stream"], true);
-
-        // Codex's follow-up: only the new item, on top of `resp_1`.
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6", "store": false,
-                "previous_response_id": "resp_1",
-                "input": [{ "role": "user", "content": "more" }]
-            }),
-        )
-        .await;
-        assert_eq!(
-            ws_turn(&mut ws).await.last().unwrap()["type"],
-            "response.completed"
-        );
-        let second: serde_json::Value =
-            serde_json::from_slice(&pool.rx.recv().await.unwrap().body).unwrap();
-        assert!(second.get("previous_response_id").is_none());
-        let input = second["input"].as_array().unwrap();
-        assert_eq!(input.len(), 3, "{input:?}");
-        assert_eq!(input[0]["content"], "hi");
-        assert_eq!(input[1]["role"], "assistant");
-        assert_eq!(input[2]["content"], "more");
-
-        // A response this connection never produced can't be rebuilt: Codex
-        // gets the error it answers by resending the full request.
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6",
-                "previous_response_id": "resp_elsewhere", "input": []
-            }),
-        )
-        .await;
-        let error = ws_turn(&mut ws).await.pop().unwrap();
-        assert_eq!(error["error"]["code"], "previous_response_not_found");
-        assert!(pool.rx.try_recv().is_err(), "nothing forwarded");
-    }
-
-    #[tokio::test]
-    async fn ws_warmup_is_answered_locally_and_can_be_continued() {
-        let mut pool = start_fake_upstream(StatusCode::OK, "text/event-stream", WS_TURN_SSE).await;
-        let url = serve_on_loopback(test_router_with_upstream(
-            1024 * 1024,
-            pool.base_url.clone(),
-        ))
-        .await;
-        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
-
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6-sol", "generate": false,
-                "input": [{ "role": "user", "content": "hi" }]
-            }),
-        )
-        .await;
-        let frames = ws_turn(&mut ws).await;
-        let warmup_id = frames.last().unwrap()["response"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            pool.rx.try_recv().is_err(),
-            "a warm-up never reaches the upstream"
-        );
-
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6-sol",
-                "previous_response_id": warmup_id,
-                "input": [{ "role": "user", "content": "go" }]
-            }),
-        )
-        .await;
-        ws_turn(&mut ws).await;
-        let body: serde_json::Value =
-            serde_json::from_slice(&pool.rx.recv().await.unwrap().body).unwrap();
-        assert!(body.get("generate").is_none());
-        let contents: Vec<_> = body["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["content"].clone())
-            .collect();
-        assert_eq!(contents, [json!("hi"), json!("go")]);
-    }
-
-    #[tokio::test]
-    async fn ws_upstream_error_becomes_an_error_frame_with_its_status() {
-        let pool = start_fake_upstream(
-            StatusCode::BAD_REQUEST,
-            "application/json",
-            r#"{"error":{"message":"bad input","type":"invalid_request_error"}}"#,
-        )
-        .await;
-        let url = serve_on_loopback(test_router_with_upstream(
-            1024 * 1024,
-            pool.base_url.clone(),
-        ))
-        .await;
-        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
-
-        ws_send(
-            &mut ws,
-            json!({ "type": "response.create", "model": "gpt-5.6-sol", "input": [] }),
-        )
-        .await;
-        let error = ws_turn(&mut ws).await.pop().unwrap();
-        assert_eq!(error["type"], "error");
-        assert_eq!(error["status"], 400);
-        assert_eq!(error["error"]["message"], "bad input");
-
-        // The connection survives a failed turn.
-        ws_send(
-            &mut ws,
-            json!({ "type": "response.create", "model": "gpt-4o", "input": [] }),
-        )
-        .await;
-        let error = ws_turn(&mut ws).await.pop().unwrap();
-        assert_eq!(error["error"]["code"], "model_not_found");
-    }
-
-    #[tokio::test]
-    async fn ws_upstream_stream_that_ends_early_still_ends_the_turn() {
-        // A clean EOF after `response.created`: over HTTP Codex sees the EOF;
-        // on the socket only an error frame ends the turn.
-        let truncated = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
-        let pool = start_fake_upstream(StatusCode::OK, "text/event-stream", truncated).await;
-        let url = serve_on_loopback(test_router_with_upstream(
-            1024 * 1024,
-            pool.base_url.clone(),
-        ))
-        .await;
-        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
-
-        ws_send(
-            &mut ws,
-            json!({ "type": "response.create", "model": "gpt-5.6-sol", "input": [] }),
-        )
-        .await;
-        let frames = ws_turn(&mut ws).await;
-        assert_eq!(frames[0]["type"], "response.created");
-        let error = frames.last().unwrap();
-        assert_eq!(error["type"], "error");
-        assert_eq!(error["status"], 502);
-
-        // Nothing to continue from: the turn never completed.
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6-sol",
-                "previous_response_id": "resp_1", "input": []
-            }),
-        )
-        .await;
-        let error = ws_turn(&mut ws).await.pop().unwrap();
-        assert_eq!(error["error"]["code"], "previous_response_not_found");
-    }
-
-    #[tokio::test]
-    async fn ws_oversized_frame_gets_a_413_like_http() {
-        let pool = start_fake_upstream(StatusCode::OK, "text/event-stream", WS_TURN_SSE).await;
-        let url = serve_on_loopback(test_router_with_upstream(1024, pool.base_url.clone())).await;
-        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
-
-        ws_send(
-            &mut ws,
-            json!({
-                "type": "response.create", "model": "gpt-5.6-sol",
-                "input": [{ "role": "user", "content": "x".repeat(4096) }]
-            }),
-        )
-        .await;
-        let error = ws_turn(&mut ws).await.pop().unwrap();
-        assert_eq!(error["type"], "error");
-        assert_eq!(error["status"], 413);
-    }
-
-    #[tokio::test]
-    async fn ws_upgrade_requires_a_client_key() {
-        let pool = start_fake_upstream(StatusCode::OK, "text/event-stream", WS_TURN_SSE).await;
-        let url = serve_on_loopback(test_router_with_upstream(
-            1024 * 1024,
-            pool.base_url.clone(),
-        ))
-        .await;
-        match ws_connect(&url, None).await {
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            }
-            other => panic!("expected a 401 handshake, got {:?}", other.map(|_| ())),
         }
     }
 }

@@ -522,54 +522,6 @@ pub fn tee_responses(
     }
 }
 
-/// Split an upstream Responses SSE body into its `data:` payloads — one JSON
-/// event each, unmodified — for a transport that frames events itself (the
-/// WebSocket bridge sends each as one text frame). Emits `log` with the
-/// usage from `response.completed` once the body is drained. An event that
-/// grows past `max_event_bytes` without a boundary ends the stream with an
-/// error, as in `stream_chat`: here the event IS the payload, so it can't be
-/// skipped the way `tee_responses` skips attribution.
-pub fn sse_events(
-    resp: reqwest::Response,
-    log: CompletionLog,
-    max_event_bytes: usize,
-) -> impl Stream<Item = Result<String, ProxyError>> {
-    let status = resp.status().as_u16();
-    try_stream! {
-        let mut usage = None;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut body = resp.bytes_stream();
-
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| ProxyError::Upstream(format!("stream read: {e}")))?;
-            buf.extend_from_slice(&chunk);
-            while let Some((pos, dlen)) = find_event_delimiter(&buf) {
-                let block: Vec<u8> = buf.drain(..pos + dlen).collect();
-                let block = String::from_utf8_lossy(&block);
-                let Some(data) = extract_data(&block) else { continue };
-                if data == "[DONE]" {
-                    continue;
-                }
-                if data.contains("\"response.completed\"") {
-                    if let Ok(evt) = serde_json::from_str::<Value>(&data) {
-                        if evt.get("type").and_then(Value::as_str) == Some("response.completed") {
-                            usage = usage_tokens(&evt);
-                        }
-                    }
-                }
-                yield data;
-            }
-            if buf.len() > max_event_bytes {
-                Err(ProxyError::Upstream(format!(
-                    "upstream SSE event exceeded {max_event_bytes} bytes without an event boundary"
-                )))?;
-            }
-        }
-
-        log.emit(status, usage);
-    }
-}
-
 /// Incremental SSE scanner that watches a byte stream for the
 /// `response.completed` event and remembers its token usage — without altering
 /// the bytes. Chunk boundaries are arbitrary (an event may be split across
