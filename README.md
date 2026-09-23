@@ -362,6 +362,26 @@ disables the metrics server without disabling collection.
 - `codexproxy_rejected_requests_total{client, reason}` — requests refused
   instead of paid for: `unknown_model` or `pool_bad_request`
 
+Per pool account (`account` is the same label as above), read live at
+scrape time:
+
+- `codexproxy_account_state{account, state}` — `1` for the state the account
+  is in (`ready`, `cooling`, `quota_held`), `0` for the others
+- `codexproxy_account_quota_used_percent{account, window}` — the
+  subscription quota used, as the real Codex CLI's `/status` shows it.
+  `window` is the window's length (`5h`, `7d`), not its slot: a pro account
+  has only a weekly window, a plus account a 5h and a weekly one
+- `codexproxy_account_quota_reset_timestamp_seconds{account, window}` — when
+  that window resets (unix seconds; `… - time()` is the countdown)
+- `codexproxy_account_credits_balance{account}`
+- `codexproxy_account_info{account, plan_type}` — always `1`
+- `codexproxy_account_quota_observed_timestamp_seconds{account}` — when the
+  quota above was last reported. It comes from the headers of every
+  `/responses` answer, so an account serving traffic is always current; an
+  idle one is refreshed by the usage poll every `quota_check_interval_secs`.
+  With polling disabled an idle account's quota just ages — alert on this
+  gauge rather than trusting a stale percentage
+
 `model` is clamped to the models this proxy actually serves — anything else
 shows up as `other`, so a client sending garbage can't create unbounded
 Prometheus series. The access log still shows the real value. On

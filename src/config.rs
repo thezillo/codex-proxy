@@ -192,8 +192,10 @@ pub struct UpstreamConfig {
     /// the poller re-reads `usage_path` for it every this many seconds and
     /// clears the state as soon as the usage report says the quota is back,
     /// which can happen before the originally reported reset (manual reset,
-    /// plan change). `0` disables polling: the state then only clears when
-    /// the reset time reported on the 429 passes.
+    /// plan change). The same poll refreshes the quota metrics of accounts
+    /// with no traffic for an interval (see `Upstream::poll_quota_once`).
+    /// `0` disables polling: the state then only clears when the reset time
+    /// reported on the 429 passes.
     pub quota_check_interval_secs: u64,
 }
 
