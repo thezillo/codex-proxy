@@ -30,7 +30,48 @@ struct PoolEntry {
     /// by the quota poller (`poll_quota_once`) when the usage report says
     /// the quota is back.
     quota_exhausted_until: Mutex<Option<Instant>>,
+    /// The account's subscription quota as last reported upstream (the
+    /// `x-codex-*` headers of a `/responses` call, or a usage poll), with
+    /// when it was observed. Observability only: selection never reads it.
+    quota: Mutex<Option<(Instant, QuotaSnapshot)>>,
 }
+
+/// One rate-limit window of an account's subscription quota.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaWindow {
+    /// The window's length (`5h`, `7d`), or its slot name (`primary`,
+    /// `secondary`) when upstream didn't say. Length, not slot, because the
+    /// slots mean different things per plan: a pro account reports its
+    /// weekly window as `primary` with no `secondary` at all, a plus account
+    /// reports 5h as `primary` and weekly as `secondary`.
+    pub label: String,
+    pub used_percent: f64,
+    /// Unix seconds.
+    pub reset_at: Option<u64>,
+}
+
+/// An account's subscription quota, as the real Codex CLI's `/status`
+/// shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaSnapshot {
+    pub windows: Vec<QuotaWindow>,
+    pub plan_type: Option<String>,
+    pub credits_balance: Option<f64>,
+    /// Unix seconds.
+    pub observed_at: u64,
+}
+
+/// A pool account's state for the metrics scrape.
+pub struct AccountStatus {
+    pub account: Arc<str>,
+    /// `ready`, `cooling` or `quota_held`.
+    pub state: &'static str,
+    pub quota: Option<QuotaSnapshot>,
+}
+
+/// Every value `AccountStatus::state` can take, so the scrape can export
+/// a 0 for the states an account is NOT in.
+pub const ACCOUNT_STATES: &[&str] = &["ready", "cooling", "quota_held"];
 
 /// How usable a pool account is right now, worst last — so selection is one
 /// `min_by_key` and "prefer a 30s-cooling account over one a week from its
@@ -40,6 +81,16 @@ enum Availability {
     Ready,
     Cooling,
     QuotaHeld,
+}
+
+impl Availability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Availability::Ready => "ready",
+            Availability::Cooling => "cooling",
+            Availability::QuotaHeld => "quota_held",
+        }
+    }
 }
 
 /// Time left on a timer slot, `None` once it has lapsed (or was never set).
@@ -89,6 +140,20 @@ impl PoolEntry {
 
     fn clear_quota_exhausted(&self) {
         *self.quota_exhausted_until.lock().unwrap() = None;
+    }
+
+    fn observe_quota(&self, snapshot: QuotaSnapshot) {
+        *self.quota.lock().unwrap() = Some((Instant::now(), snapshot));
+    }
+
+    /// No quota report within `max_age` (or ever) — the poller's cue to
+    /// ask. An account serving traffic stays fresh from response headers
+    /// alone and is never polled while healthy.
+    fn quota_stale(&self, now: Instant, max_age: Duration) -> bool {
+        match *self.quota.lock().unwrap() {
+            Some((seen, _)) => now.saturating_duration_since(seen) >= max_age,
+            None => true,
+        }
     }
 }
 
@@ -312,6 +377,7 @@ impl Upstream {
                 label: label.into(),
                 cooldown_until: Mutex::new(None),
                 quota_exhausted_until: Mutex::new(None),
+                quota: Mutex::new(None),
             })
             .collect();
         Self {
@@ -421,6 +487,21 @@ impl Upstream {
         })
     }
 
+    /// Every pool account's current state and last quota report, in pool
+    /// order — read by the metrics scrape, so it's live at scrape time
+    /// (a cooldown lapsing is not an event anything else would notice).
+    pub fn account_statuses(&self) -> Vec<AccountStatus> {
+        let now = Instant::now();
+        self.pool
+            .iter()
+            .map(|entry| AccountStatus {
+                account: entry.label.clone(),
+                state: entry.availability(now).as_str(),
+                quota: entry.quota.lock().unwrap().as_ref().map(|(_, q)| q.clone()),
+            })
+            .collect()
+    }
+
     /// Forward a raw JSON body to `/responses`, returning the response
     /// (streamed — we do not buffer the body) together with which pool
     /// account ultimately served it.
@@ -493,6 +574,14 @@ impl Upstream {
                 .await
             {
                 Ok(response) => {
+                    // Every `/responses` answer, 429s included, carries the
+                    // account's quota in its headers — free, per-request
+                    // freshness. Not compact/search: see the doc above.
+                    if endpoint == Endpoint::Responses {
+                        if let Some(quota) = quota_from_headers(response.headers(), unix_now()) {
+                            self.pool[idx].observe_quota(quota);
+                        }
+                    }
                     if endpoint == Endpoint::Responses && is_account_failure(response.status()) {
                         self.pool[idx].start_cooldown(self.account_cooldown);
                         let (response, quota) = self.classify_rate_limit(&account, response).await;
@@ -603,25 +692,29 @@ impl Upstream {
     }
 
     /// Run the quota poller until the process exits: every interval, re-check
-    /// each quota-exhausted account against the usage endpoint. Spawned once
-    /// from `main` when `quota_check_interval_secs > 0`.
+    /// each quota-exhausted or idle account against the usage endpoint.
+    /// Spawned once from `main` when `quota_check_interval_secs > 0`.
     pub async fn quota_poll_loop(self: Arc<Self>) {
         let Some(interval) = self.quota_poll_interval else {
             return;
         };
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires immediately; nothing is exhausted at boot.
-        ticker.tick().await;
+        // The first tick fires immediately: nothing is exhausted at boot,
+        // but no account has a quota report yet either, so the usage
+        // metrics are filled in right away rather than one interval later.
         loop {
             ticker.tick().await;
             self.poll_quota_once().await;
         }
     }
 
-    /// One poller pass over the pool. Only quota-exhausted accounts are
-    /// queried — a healthy account gets no extra traffic, and an account
-    /// whose hold has already lapsed is back in rotation without a check.
+    /// One poller pass over the pool. Queried: quota-exhausted accounts (to
+    /// clear the hold early), and accounts with no quota report within the
+    /// poll interval (idle ones — for the usage metrics). An account serving
+    /// traffic is never polled while healthy: its `/responses` headers
+    /// already carry the same report. An account whose hold has already
+    /// lapsed is back in rotation without a check.
     ///
     /// Fail-open policy, decided here once: a poll that errors (endpoint
     /// down, token refresh failed, unparseable body) changes nothing — the
@@ -632,40 +725,53 @@ impl Upstream {
     /// account. Letting the 429's own reset time win is the middle ground.
     pub(crate) async fn poll_quota_once(&self) {
         let now = Instant::now();
+        let max_age = self.quota_hold_default();
         // Concurrent, not one after another: a stalled usage GET for one
         // account must not delay every other account's re-check.
         let checks = self
             .pool
             .iter()
-            .filter(|e| e.is_quota_exhausted(now))
+            .filter(|e| e.is_quota_exhausted(now) || e.quota_stale(now, max_age))
             .map(|entry| self.poll_account(entry));
         futures_util::future::join_all(checks).await;
     }
 
     async fn poll_account(&self, entry: &PoolEntry) {
         let account = &entry.label;
-        match self.fetch_usage(&entry.auth).await {
+        let was_held = entry.is_quota_exhausted(Instant::now());
+        let result = self.fetch_usage(&entry.auth).await;
+        if let Ok(report) = &result {
+            entry.observe_quota(report.quota.clone());
+        }
+        match result {
             Ok(report) if report.exhausted => {
                 let hold = report
                     .reset_in
                     .map(clamp_quota_hold)
                     .unwrap_or_else(|| self.quota_hold_default());
+                // An idle account found exhausted is held right away, sparing
+                // the next request the 429 round-trip that would learn it.
                 entry.mark_quota_exhausted(hold);
                 tracing::info!(
                     %account,
                     used_percent = report.max_used_percent,
                     hold_secs = hold.as_secs(),
-                    "usage poll: quota still exhausted"
+                    "usage poll: quota exhausted"
                 );
             }
             Ok(report) => {
-                entry.clear_quota_exhausted();
-                tracing::info!(
-                    %account,
-                    used_percent = report.max_used_percent,
-                    "usage poll: quota available again, account back in rotation"
-                );
+                if was_held {
+                    entry.clear_quota_exhausted();
+                    tracing::info!(
+                        %account,
+                        used_percent = report.max_used_percent,
+                        "usage poll: quota available again, account back in rotation"
+                    );
+                }
             }
+            // An idle account's failed poll lands here too: its usage
+            // metrics just keep their last value (and age, see
+            // `codexproxy_account_quota_observed_timestamp_seconds`).
             Err(e) => {
                 tracing::warn!(
                     %account,
@@ -1081,6 +1187,72 @@ pub(crate) struct UsageReport {
     /// must not lose to the 5h window's relative `reset_after_seconds` just
     /// because of which field each one used.
     pub reset_in: Option<Duration>,
+    /// The full report, for the usage metrics.
+    pub quota: QuotaSnapshot,
+}
+
+/// Metric label for a quota window: its length when known (`5h`, `7d`),
+/// else its slot name.
+fn window_label(minutes: Option<u64>, slot: &str) -> String {
+    match minutes {
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{}d", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+        Some(m) if m > 0 => format!("{m}m"),
+        _ => slot.to_string(),
+    }
+}
+
+/// The quota report the backend attaches to every `/responses` answer —
+/// the same data as the usage endpoint, and what the real Codex CLI's
+/// `/status` reads between polls:
+/// `x-codex-{primary,secondary}-{used-percent,window-minutes,reset-at,
+/// reset-after-seconds}`, `x-codex-plan-type`, `x-codex-credits-balance`.
+/// A slot the plan doesn't have still arrives, as `window-minutes: 0` and an
+/// empty `reset-at` (seen live on a pro account), and is skipped. `None` when
+/// no window is reported at all (fake upstreams, fallback providers).
+fn quota_from_headers(headers: &reqwest::header::HeaderMap, now: u64) -> Option<QuotaSnapshot> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let mut windows = Vec::new();
+    for slot in ["primary", "secondary"] {
+        let Some(used_percent) =
+            header(&format!("x-codex-{slot}-used-percent")).and_then(|s| s.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let minutes =
+            header(&format!("x-codex-{slot}-window-minutes")).and_then(|s| s.parse::<u64>().ok());
+        if minutes == Some(0) {
+            continue;
+        }
+        let reset_at = header(&format!("x-codex-{slot}-reset-at"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                header(&format!("x-codex-{slot}-reset-after-seconds"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|secs| *secs > 0)
+                    .map(|secs| now + secs)
+            });
+        windows.push(QuotaWindow {
+            label: window_label(minutes, slot),
+            used_percent,
+            reset_at,
+        });
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(QuotaSnapshot {
+        windows,
+        plan_type: header("x-codex-plan-type").map(str::to_string),
+        credits_balance: header("x-codex-credits-balance").and_then(|s| s.parse().ok()),
+        observed_at: now,
+    })
 }
 
 /// Parse the `/wham/usage` payload:
@@ -1099,7 +1271,11 @@ pub(crate) fn parse_usage_report(body: &[u8], now: u64) -> Option<UsageReport> {
         .unwrap_or(false);
     let mut max_used_percent: f64 = 0.0;
     let mut reset_in = None;
-    for key in ["primary_window", "secondary_window"] {
+    let mut windows = Vec::new();
+    for (key, slot) in [
+        ("primary_window", "primary"),
+        ("secondary_window", "secondary"),
+    ] {
         let Some(window) = rate_limit.get(key).filter(|w| w.is_object()) else {
             continue;
         };
@@ -1108,6 +1284,20 @@ pub(crate) fn parse_usage_report(body: &[u8], now: u64) -> Option<UsageReport> {
             .and_then(as_f64_lossy)
             .unwrap_or(0.0);
         max_used_percent = max_used_percent.max(used);
+        let minutes = window
+            .get("limit_window_seconds")
+            .and_then(as_u64_lossy)
+            .map(|secs| secs / 60);
+        windows.push(QuotaWindow {
+            label: window_label(minutes, slot),
+            used_percent: used,
+            reset_at: window.get("reset_at").and_then(as_u64_lossy).or_else(|| {
+                window
+                    .get("reset_after_seconds")
+                    .and_then(as_u64_lossy)
+                    .map(|secs| now + secs)
+            }),
+        });
         if used >= 100.0 {
             reset_in = reset_in.max(self::reset_in(
                 window,
@@ -1121,6 +1311,19 @@ pub(crate) fn parse_usage_report(body: &[u8], now: u64) -> Option<UsageReport> {
         exhausted: limit_reached || max_used_percent >= 100.0,
         max_used_percent,
         reset_in,
+        quota: QuotaSnapshot {
+            windows,
+            plan_type: parsed
+                .get("plan_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            // A decimal string on the wire (`"balance": "0"`).
+            credits_balance: parsed
+                .get("credits")
+                .and_then(|c| c.get("balance"))
+                .and_then(as_f64_lossy),
+            observed_at: now,
+        },
     })
 }
 
@@ -1717,11 +1920,17 @@ mod tests {
         } else {
             r#"{"ok":true}"#
         };
-        Response::builder()
+        let mut response = Response::builder()
             .status(status)
-            .header("Content-Type", "application/json")
-            .body(Body::from(body))
-            .unwrap()
+            .header("Content-Type", "application/json");
+        // Only on success: the quota tests script their 429's reset
+        // themselves, and a header reset would win over it.
+        if status == 200 {
+            for (name, value) in PRO_QUOTA_HEADERS {
+                response = response.header(*name, *value);
+            }
+        }
+        response.body(Body::from(body)).unwrap()
     }
 
     async fn scripted_usage(State(state): State<ScriptedState>, headers: HeaderMap) -> Response {
@@ -2022,6 +2231,177 @@ mod tests {
             hold(&with_header, r#"{"error":{"type":"usage_limit_reached"}}"#),
             expect(86400, "header")
         );
+    }
+
+    /// Quota headers of a real `/responses` answer for a pro account
+    /// (captured 2026-09-23): one weekly window, reported as `primary`, and
+    /// an unused `secondary` slot sent as zeros rather than omitted.
+    const PRO_QUOTA_HEADERS: &[(&str, &str)] = &[
+        ("x-codex-active-limit", "premium"),
+        ("x-codex-plan-type", "pro"),
+        ("x-codex-primary-used-percent", "17"),
+        ("x-codex-secondary-used-percent", "0"),
+        ("x-codex-primary-window-minutes", "10080"),
+        ("x-codex-secondary-window-minutes", "0"),
+        ("x-codex-primary-reset-after-seconds", "526623"),
+        ("x-codex-secondary-reset-after-seconds", "0"),
+        ("x-codex-primary-reset-at", "1790706958"),
+        ("x-codex-secondary-reset-at", ""),
+        ("x-codex-credits-has-credits", "False"),
+        ("x-codex-credits-balance", "0"),
+        ("x-codex-credits-unlimited", "False"),
+    ];
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn quota_from_headers_reads_the_live_pro_shape() {
+        let quota = quota_from_headers(&header_map(PRO_QUOTA_HEADERS), 1_000).unwrap();
+        assert_eq!(
+            quota,
+            QuotaSnapshot {
+                windows: vec![QuotaWindow {
+                    label: "7d".into(),
+                    used_percent: 17.0,
+                    reset_at: Some(1_790_706_958),
+                }],
+                plan_type: Some("pro".into()),
+                credits_balance: Some(0.0),
+                observed_at: 1_000,
+            }
+        );
+    }
+
+    #[test]
+    fn quota_from_headers_labels_windows_by_length_not_slot() {
+        // Plus-style: 5h in `primary`, weekly in `secondary`, and only a
+        // relative reset for one of them.
+        let quota = quota_from_headers(
+            &header_map(&[
+                ("x-codex-primary-used-percent", "42.5"),
+                ("x-codex-primary-window-minutes", "300"),
+                ("x-codex-primary-reset-after-seconds", "600"),
+                ("x-codex-secondary-used-percent", "8"),
+                ("x-codex-secondary-window-minutes", "10080"),
+                ("x-codex-secondary-reset-at", "5000"),
+            ]),
+            1_000,
+        )
+        .unwrap();
+        let windows: Vec<_> = quota
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.used_percent, w.reset_at))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![("5h", 42.5, Some(1_600)), ("7d", 8.0, Some(5_000))]
+        );
+        assert_eq!(quota.plan_type, None);
+
+        // No quota headers at all (a fake upstream, a fallback provider).
+        assert_eq!(quota_from_headers(&HeaderMap::new(), 1_000), None);
+    }
+
+    #[test]
+    fn parse_usage_report_carries_the_quota_snapshot() {
+        // The live pro-account `/wham/usage` shape (2026-09-23), trimmed.
+        let body = br#"{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":17,"limit_window_seconds":604800,"reset_after_seconds":526633,"reset_at":1790706958},"secondary_window":null},"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}"#;
+        let report = parse_usage_report(body, 1_000).unwrap();
+        assert!(!report.exhausted);
+        assert_eq!(
+            report.quota,
+            QuotaSnapshot {
+                windows: vec![QuotaWindow {
+                    label: "7d".into(),
+                    used_percent: 17.0,
+                    reset_at: Some(1_790_706_958),
+                }],
+                plan_type: Some("pro".into()),
+                credits_balance: Some(0.0),
+                observed_at: 1_000,
+            }
+        );
+        // No window length reported: the slot name stands in.
+        let report = parse_usage_report(USAGE_AVAILABLE.as_bytes(), 0).unwrap();
+        let labels: Vec<_> = report
+            .quota
+            .windows
+            .iter()
+            .map(|w| w.label.as_str())
+            .collect();
+        assert_eq!(labels, ["primary", "secondary"]);
+    }
+
+    #[tokio::test]
+    async fn responses_headers_fill_the_account_quota() {
+        let mut fake = start_scripted_upstream(std::collections::HashMap::new()).await;
+        let upstream = test_pool(&fake.base_url, 2).await;
+        assert!(upstream
+            .account_statuses()
+            .iter()
+            .all(|s| s.quota.is_none()));
+
+        upstream
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), Some(0))
+            .await
+            .unwrap();
+        let _ = fake.recv().await;
+
+        let statuses = upstream.account_statuses();
+        assert_eq!(statuses[0].state, "ready");
+        let quota = statuses[0]
+            .quota
+            .as_ref()
+            .expect("served account has a quota");
+        assert_eq!(quota.windows[0].label, "7d");
+        assert!(
+            statuses[1].quota.is_none(),
+            "the other account wasn't asked"
+        );
+
+        // A poll asks only the account with no report; the one whose
+        // headers just said it all gets no extra traffic.
+        fake.script_usage((200, USAGE_AVAILABLE)).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 1);
+        assert!(upstream.account_statuses()[1].quota.is_some());
+        upstream.poll_quota_once().await;
+        assert_eq!(fake.usage_calls(), 1, "both reports are fresh now");
+    }
+
+    #[tokio::test]
+    async fn poll_holds_an_idle_account_found_exhausted() {
+        let fake = start_scripted_upstream(std::collections::HashMap::new()).await;
+        let upstream = test_pool(&fake.base_url, 1).await;
+        fake.script_usage((200, USAGE_EXHAUSTED)).await;
+        upstream.poll_quota_once().await;
+        assert_eq!(
+            upstream.unavailable().map(|f| f.reason),
+            Some(FailureReason::QuotaExhausted),
+            "the next request must not pay a 429 round-trip to learn this"
+        );
+        assert_eq!(upstream.account_statuses()[0].state, "quota_held");
+    }
+
+    #[test]
+    fn account_states_cover_every_availability() {
+        for a in [
+            Availability::Ready,
+            Availability::Cooling,
+            Availability::QuotaHeld,
+        ] {
+            assert!(ACCOUNT_STATES.contains(&a.as_str()), "{a:?}");
+        }
     }
 
     #[test]

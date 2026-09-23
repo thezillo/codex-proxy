@@ -94,8 +94,12 @@ account_cooldown_secs = 30
 # account is in that state the proxy re-reads `usage_path` for it every
 # `quota_check_interval_secs` and clears the state as soon as the report
 # shows headroom — an early/manual reset is picked up without waiting for the
-# originally reported time. Healthy accounts are never polled. 0 disables
-# polling (the state then clears only when the reported reset passes).
+# originally reported time. The same poll also refreshes the per-account quota
+# metrics of accounts that served no traffic for an interval (at boot, every
+# account); an account serving traffic already reports its quota on every
+# response and is never polled while healthy. 0 disables polling (the state
+# then clears only when the reported reset passes, and idle accounts' quota
+# metrics go stale).
 usage_path = "/wham/usage"
 quota_check_interval_secs = 600
 # Upstream targets of /v1/responses/compact (OpenAI's stateless history

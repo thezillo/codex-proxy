@@ -111,6 +111,12 @@ async fn main() -> anyhow::Result<()> {
         .context("configuring [embeddings]")?
         .map(Arc::new);
     let metrics = Arc::new(Metrics::new().context("registering Prometheus metrics")?);
+    {
+        let upstream = upstream.clone();
+        metrics
+            .register_pool(move || upstream.account_statuses())
+            .context("registering pool metrics")?;
+    }
 
     // Guard against shipping an open door. The runtime image carries no
     // config.toml, so a cloud deploy that forgets CODEXPROXY_API_KEYS falls back
