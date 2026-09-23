@@ -294,6 +294,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
 ]
 
 [[package]]

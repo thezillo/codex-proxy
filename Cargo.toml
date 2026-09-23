@@ -12,6 +12,9 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 axum = { version = "0.7", features = ["json", "ws"] }
+# Only to tell an oversized client frame (answered 413, as over HTTP) from a
+# dead socket; the version axum's `ws` feature already builds.
+tungstenite = { version = "0.24", default-features = false }
 # TLS fingerprint parity with the real Codex Desktop client (per the icebear
 # codex-proxy reverse-engineering): reqwest 0.12.28 + rustls pinned to =0.23.36
 # (its ClientHello changed in 0.23.37), native roots, http2 (ALPN h2), and the

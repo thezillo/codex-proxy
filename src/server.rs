@@ -26,7 +26,7 @@ use crate::fallback::FallbackChain;
 use crate::metrics::{Metrics, TokenUsage};
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
-    alias_responses_model, build_codex_request, chat_json_mode_error, collect_chat, model_of,
+    alias_responses_model, build_codex_request, chat_response_format_error, collect_chat, model_of,
     rewrite_model, stream_chat, tee_responses, ChatCompletionRequest,
 };
 use crate::upstream::{Endpoint, FailureReason, ForwardedResponse, Upstream};
@@ -673,10 +673,20 @@ async fn forward_aux_json(
     let metric_model = metric_model_label(&model).to_string();
     let key = affinity::resolve(headers, info.key);
     let mut log = CompletionLog::new(ctx, path, model, metric_model, state.metrics.clone());
-    let fwd = state
+    let fwd = match state
         .upstream
         .forward(endpoint, body, headers, key.as_ref().map(|k| k.hash))
-        .await?;
+        .await
+    {
+        Ok(fwd) => fwd,
+        Err(failure) => {
+            if let Some(account) = failure.account.clone() {
+                log.set_account(account);
+            }
+            log.emit(failure.error.status().as_u16(), None);
+            return Err(failure.into());
+        }
+    };
     log.set_account(fwd.account);
     if let Some(key) = &key {
         log.set_affinity(key.source.as_str());
@@ -734,7 +744,7 @@ async fn chat_completions(
         state.metrics.clone(),
     );
 
-    if let Some(message) = chat_json_mode_error(&req) {
+    if let Some((message, param, code)) = chat_response_format_error(&req) {
         log.emit(StatusCode::BAD_REQUEST.as_u16(), None);
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -742,8 +752,8 @@ async fn chat_completions(
                 "error": {
                     "message": message,
                     "type": "invalid_request_error",
-                    "param": "messages",
-                    "code": null,
+                    "param": param,
+                    "code": code,
                 }
             })),
         )
@@ -3452,6 +3462,62 @@ mod tests {
         .await;
         let error = ws_turn(&mut ws).await.pop().unwrap();
         assert_eq!(error["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn ws_upstream_stream_that_ends_early_still_ends_the_turn() {
+        // A clean EOF after `response.created`: over HTTP Codex sees the EOF;
+        // on the socket only an error frame ends the turn.
+        let truncated = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+        let pool = start_fake_upstream(StatusCode::OK, "text/event-stream", truncated).await;
+        let url = serve_on_loopback(test_router_with_upstream(
+            1024 * 1024,
+            pool.base_url.clone(),
+        ))
+        .await;
+        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
+
+        ws_send(
+            &mut ws,
+            json!({ "type": "response.create", "model": "gpt-5.6-sol", "input": [] }),
+        )
+        .await;
+        let frames = ws_turn(&mut ws).await;
+        assert_eq!(frames[0]["type"], "response.created");
+        let error = frames.last().unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["status"], 502);
+
+        // Nothing to continue from: the turn never completed.
+        ws_send(
+            &mut ws,
+            json!({
+                "type": "response.create", "model": "gpt-5.6-sol",
+                "previous_response_id": "resp_1", "input": []
+            }),
+        )
+        .await;
+        let error = ws_turn(&mut ws).await.pop().unwrap();
+        assert_eq!(error["error"]["code"], "previous_response_not_found");
+    }
+
+    #[tokio::test]
+    async fn ws_oversized_frame_gets_a_413_like_http() {
+        let pool = start_fake_upstream(StatusCode::OK, "text/event-stream", WS_TURN_SSE).await;
+        let url = serve_on_loopback(test_router_with_upstream(1024, pool.base_url.clone())).await;
+        let mut ws = ws_connect(&url, Some("test-key")).await.unwrap();
+
+        ws_send(
+            &mut ws,
+            json!({
+                "type": "response.create", "model": "gpt-5.6-sol",
+                "input": [{ "role": "user", "content": "x".repeat(4096) }]
+            }),
+        )
+        .await;
+        let error = ws_turn(&mut ws).await.pop().unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["status"], 413);
     }
 
     #[tokio::test]

@@ -147,15 +147,13 @@ pub fn build_codex_request(req: &ChatCompletionRequest, defaults: &DefaultsConfi
     // contain the word 'json'"), and the system prompt normally becomes
     // `instructions`. So when only the system prompt says it, the client's
     // system messages go into `input` instead, as `developer` items — their
-    // own words, at their own positions. `chat_json_mode_error` has already
-    // refused a request that never says it, as Chat would.
+    // own words, at their own positions. They also stay `instructions`, as
+    // without JSON mode: the configured default must not start reaching the
+    // model just because `response_format` is set. `chat_response_format_error`
+    // has already refused a request that never says it, as Chat would.
     let system_in_input = format.as_ref().is_some_and(|f| f["type"] == "json_object")
         && !mentions_json(req.messages.iter().filter(|m| !is_system(m)));
-    let instructions = if system_in_input {
-        defaults.instructions.clone()
-    } else {
-        collect_instructions(req, defaults)
-    };
+    let instructions = collect_instructions(req, defaults);
     let input = build_input(req, system_in_input);
     let model = resolve_model(&req.model, defaults);
 
@@ -216,19 +214,52 @@ fn resolve_model(requested: &str, defaults: &DefaultsConfig) -> String {
     }
 }
 
-/// OpenAI Chat's own refusal of JSON mode without the word "json" in any
-/// message, reproduced here so a client sees exactly what OpenAI would send:
-/// `Some(message)` for a 400 `invalid_request_error` on `param: "messages"`.
-/// Without the instruction the model may stream whitespace until the token
-/// limit, which is why OpenAI refuses it rather than guessing.
-pub fn chat_json_mode_error(req: &ChatCompletionRequest) -> Option<&'static str> {
+/// A `response_format` OpenAI Chat itself would refuse, as the 400
+/// `invalid_request_error` it sends: `(message, param, code)`. Checked before
+/// translating, so a malformed format is never silently dropped into a
+/// plain-text run.
+///
+/// Includes Chat's refusal of JSON mode without the word "json" in any
+/// message: without the instruction the model may stream whitespace until
+/// the token limit, which is why OpenAI refuses it rather than guessing.
+pub fn chat_response_format_error(
+    req: &ChatCompletionRequest,
+) -> Option<(String, &'static str, Option<&'static str>)> {
     let rf = req.response_format.as_ref()?;
-    if rf.get("type").and_then(Value::as_str) != Some("json_object")
-        || mentions_json(req.messages.iter())
-    {
-        return None;
+    match rf.get("type").and_then(Value::as_str) {
+        Some("text") => None,
+        Some("json_object") if mentions_json(req.messages.iter()) => None,
+        Some("json_object") => Some((
+            "'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.".into(),
+            "messages",
+            None,
+        )),
+        Some("json_schema") => match rf.get("json_schema") {
+            Some(spec) if spec.is_object() && spec.get("name").is_some_and(Value::is_string) => {
+                None
+            }
+            Some(spec) if spec.is_object() => Some((
+                "Missing required parameter: 'response_format.json_schema.name'.".into(),
+                "response_format.json_schema.name",
+                Some("missing_required_parameter"),
+            )),
+            _ => Some((
+                "Missing required parameter: 'response_format.json_schema'.".into(),
+                "response_format.json_schema",
+                Some("missing_required_parameter"),
+            )),
+        },
+        Some(other) => Some((
+            format!("Invalid value: '{other}'. Supported values are: 'text', 'json_object', and 'json_schema'."),
+            "response_format.type",
+            Some("invalid_value"),
+        )),
+        None => Some((
+            "Missing required parameter: 'response_format.type'.".into(),
+            "response_format.type",
+            Some("missing_required_parameter"),
+        )),
     }
-    Some("'messages' must contain the word 'json' in some form, to use 'response_format' of type 'json_object'.")
 }
 
 fn is_system(m: &ChatMessage) -> bool {
@@ -721,7 +752,7 @@ mod tests {
             ],
             "response_format": { "type": "json_object" }
         }));
-        assert_eq!(chat_json_mode_error(&req), None);
+        assert_eq!(chat_response_format_error(&req), None);
         let defaults = DefaultsConfig::default();
         let body = build_codex_request(&req, &defaults);
         assert_eq!(
@@ -729,7 +760,8 @@ mod tests {
             json!({ "role": "developer", "content": "Reply in JSON." })
         );
         assert_eq!(body["input"][1]["content"], "largest planet?");
-        assert_eq!(body["instructions"], defaults.instructions);
+        // No configured text reaches the model on the client's behalf.
+        assert_eq!(body["instructions"], "Reply in JSON.");
 
         // The user already says it: the system prompt stays `instructions`.
         let req = parse(json!({
@@ -752,9 +784,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "largest planet?" }],
             "response_format": { "type": "json_object" }
         }));
-        assert!(chat_json_mode_error(&req)
-            .unwrap()
-            .contains("must contain the word 'json'"));
+        let (message, param, _) = chat_response_format_error(&req).unwrap();
+        assert!(message.contains("must contain the word 'json'"));
+        assert_eq!(param, "messages");
 
         // json_schema carries no such rule.
         let req = parse(json!({
@@ -762,19 +794,46 @@ mod tests {
             "messages": [{ "role": "user", "content": "largest planet?" }],
             "response_format": { "type": "json_schema", "json_schema": { "name": "x", "schema": {} } }
         }));
-        assert_eq!(chat_json_mode_error(&req), None);
+        assert_eq!(chat_response_format_error(&req), None);
     }
 
     #[test]
     fn plain_text_response_format_sends_no_text_field() {
-        for rf in [json!({ "type": "text" }), json!({ "type": "json_schema" })] {
+        let req = parse(json!({
+            "model": "gpt-6-astra",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "text" }
+        }));
+        assert_eq!(chat_response_format_error(&req), None);
+        let body = build_codex_request(&req, &DefaultsConfig::default());
+        assert!(body.get("text").is_none());
+    }
+
+    #[test]
+    fn a_malformed_response_format_is_refused_like_openai_chat() {
+        for (rf, param) in [
+            (
+                json!({ "type": "json_schema" }),
+                "response_format.json_schema",
+            ),
+            (
+                json!({ "type": "json_schema", "json_schema": "x" }),
+                "response_format.json_schema",
+            ),
+            (
+                json!({ "type": "json_schema", "json_schema": { "schema": {} } }),
+                "response_format.json_schema.name",
+            ),
+            (json!({ "type": "yaml" }), "response_format.type"),
+            (json!({}), "response_format.type"),
+        ] {
             let req = parse(json!({
                 "model": "gpt-6-astra",
                 "messages": [{ "role": "user", "content": "hi" }],
                 "response_format": rf
             }));
-            let body = build_codex_request(&req, &DefaultsConfig::default());
-            assert!(body.get("text").is_none(), "{rf}");
+            let (_, got, _) = chat_response_format_error(&req).expect("refused");
+            assert_eq!(got, param, "{rf}");
         }
     }
 }

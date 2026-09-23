@@ -213,8 +213,10 @@ in the logs, it's one of these three — the message names which.
   message, the system prompt included, is enough, and a request that never
   says it gets OpenAI's own 400 (`'messages' must contain the word 'json'…`).
   The backend only looks at `input`, so when only the system prompt says it,
-  those system messages are sent as `developer` input items rather than
-  `instructions`.
+  those system messages are also sent as `developer` input items (they stay
+  `instructions` too, so the configured default never replaces them). A
+  `response_format` OpenAI would refuse (unknown `type`, `json_schema`
+  without its object or `name`) gets OpenAI's 400 too.
 - `POST /v1/responses` — passthrough to the Codex Responses API. Forwarded
   byte-for-byte, with one exception: a `model` that `[defaults.model_aliases]`
   maps is rewritten, since Codex speaks this wire API and a bare `gpt-6` /

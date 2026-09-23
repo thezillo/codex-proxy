@@ -61,8 +61,8 @@ struct Continuation {
 /// raw text, so the (possibly multi-MB) `input` is never parsed into a tree.
 type Frame = BTreeMap<String, Box<RawValue>>;
 
-/// The two events the continuation is built from, and only the fields it
-/// needs; serde skips the rest without building anything.
+/// The events the continuation is built from and those that end a turn, and
+/// only the fields needed; serde skips the rest without building anything.
 #[derive(Deserialize)]
 struct TrackedEvent {
     #[serde(rename = "type")]
@@ -94,7 +94,23 @@ async fn serve(state: AppState, ctx: AccessCtx, headers: HeaderMap, mut socket: 
     // Frames are handled strictly one at a time, like the upstream socket:
     // Codex never sends a second `response.create` before the first one's
     // `response.completed` (or error).
-    while let Some(Ok(message)) = socket.recv().await {
+    loop {
+        let message = match socket.recv().await {
+            Some(Ok(message)) => message,
+            Some(Err(e)) => {
+                // Over HTTP an oversized body is a 413; say the same here
+                // rather than drop the socket, which Codex would retry as a
+                // transport failure with the same frame.
+                if is_oversized(&e) {
+                    let max = state.config.server.max_body_bytes;
+                    let message = format!("request exceeds {max} bytes");
+                    let _ =
+                        send_error(&mut socket, 413, "invalid_request_error", None, &message).await;
+                }
+                break;
+            }
+            None => break,
+        };
         let text = match message {
             Message::Text(text) => text,
             Message::Close(_) => break,
@@ -123,6 +139,12 @@ async fn serve(state: AppState, ctx: AccessCtx, headers: HeaderMap, mut socket: 
             break;
         }
     }
+}
+
+fn is_oversized(error: &axum::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|e| matches!(e, tungstenite::Error::Capacity(_)))
 }
 
 /// One `response.create`. `Err` only when the client socket is gone.
@@ -245,7 +267,34 @@ async fn handle_create(
     let mut events = std::pin::pin!(sse_events(upstream, log, max_body_bytes));
     let mut output = Vec::new();
     let mut completed_id = None;
-    while let Some(event) = events.next().await {
+    let mut terminal = false;
+    loop {
+        // The socket is read while the answer streams, so a client that
+        // leaves is noticed at once: returning drops `events`, and with it
+        // the upstream request, instead of letting it run on a pool account.
+        // Reading is also what gets pings their pongs.
+        let event = tokio::select! {
+            event = events.next() => event,
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                    send_error(
+                        socket,
+                        400,
+                        "invalid_request_error",
+                        None,
+                        "a response is already in progress on this connection",
+                    )
+                    .await?;
+                    continue;
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                    tracing::debug!("websocket client left mid-response; upstream request dropped");
+                    return Err(axum::Error::new("client closed the socket mid-response"));
+                }
+            },
+        };
+        let Some(event) = event else { break };
         let data = match event {
             Ok(data) => data,
             Err(e) => {
@@ -254,14 +303,17 @@ async fn handle_create(
                 return send_error(socket, 502, "server_error", None, &e.to_string()).await;
             }
         };
-        // Only the two event kinds the continuation needs are parsed; the
-        // rest (mostly small deltas) go through untouched.
-        if data.contains("\"response.output_item.done\"") || data.contains("\"response.completed\"")
-        {
+        // Only the event kinds the continuation and the turn's end need are
+        // parsed; the rest (mostly small deltas) go through untouched.
+        if TRACKED_KINDS.iter().any(|kind| data.contains(kind)) {
             if let Ok(event) = serde_json::from_str::<TrackedEvent>(&data) {
                 match event.kind.as_str() {
                     "response.output_item.done" => output.extend(event.item),
-                    "response.completed" => completed_id = event.response.and_then(|r| r.id),
+                    "response.completed" => {
+                        terminal = true;
+                        completed_id = event.response.and_then(|r| r.id);
+                    }
+                    "response.failed" | "response.incomplete" | "error" => terminal = true,
                     _ => {}
                 }
             }
@@ -269,6 +321,18 @@ async fn handle_create(
         socket.send(Message::Text(data)).await?;
     }
 
+    if !terminal {
+        // The upstream body ended cleanly but early. Over HTTP Codex sees the
+        // EOF and retries; on the socket nothing would ever end the turn.
+        return send_error(
+            socket,
+            502,
+            "server_error",
+            None,
+            "upstream stream ended before the response completed",
+        )
+        .await;
+    }
     if let (Some(response_id), Some(input)) = (completed_id, input) {
         *last = Some(Continuation {
             response_id,
@@ -278,6 +342,15 @@ async fn handle_create(
     }
     Ok(())
 }
+
+/// Substrings of the events `handle_create` parses (see `TrackedEvent`).
+const TRACKED_KINDS: &[&str] = &[
+    "\"response.output_item.done\"",
+    "\"response.completed\"",
+    "\"response.failed\"",
+    "\"response.incomplete\"",
+    "\"error\"",
+];
 
 /// Remove `key` from the frame and decode it as `T`; `None` when absent or
 /// of another type.
@@ -337,7 +410,9 @@ fn array_items(json: &str) -> Option<&str> {
 }
 
 /// The Responses body for a frame: its members as sent, `stream` forced on,
-/// and `input` (when given) as the rebuilt item list.
+/// and `input` (when given) as the rebuilt item list — written last, so the
+/// alias splice in `dispatch_responses` finds the top-level `model` without
+/// scanning (or being fooled by) a multi-MB history first.
 fn encode_request(request: &Frame, input: Option<&str>) -> Vec<u8> {
     let size: usize = request
         .iter()
@@ -345,16 +420,20 @@ fn encode_request(request: &Frame, input: Option<&str>) -> Vec<u8> {
         .sum();
     let mut out = String::with_capacity(size + input.map_or(0, str::len) + 32);
     out.push_str("{\"stream\":true");
-    if let Some(items) = input {
-        out.push_str(",\"input\":[");
-        out.push_str(items);
-        out.push(']');
-    }
-    for (key, value) in request.iter().filter(|(key, _)| *key != "stream") {
+    let (history, rest): (Vec<_>, Vec<_>) = request
+        .iter()
+        .filter(|(key, _)| *key != "stream")
+        .partition(|(key, _)| *key == "input");
+    for (key, value) in rest.into_iter().chain(history) {
         out.push(',');
         out.push_str(&Value::String(key.clone()).to_string());
         out.push(':');
         out.push_str(value.get());
+    }
+    if let Some(items) = input {
+        out.push_str(",\"input\":[");
+        out.push_str(items);
+        out.push(']');
     }
     out.push('}');
     out.into_bytes()
@@ -466,7 +545,9 @@ mod tests {
         let input = rebuild_input(&mut request, Some(previous))
             .unwrap()
             .unwrap();
-        let body: Value = serde_json::from_slice(&encode_request(&request, Some(&input))).unwrap();
+        let encoded = encode_request(&request, Some(&input));
+        let body: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(encoded.ends_with(br#"{"c":3}]}"#), "input is written last");
         assert_eq!(
             body,
             json!({ "stream": true, "input": [{ "a": 1 }, { "b": 2 }, { "c": 3 }] })
