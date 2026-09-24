@@ -546,9 +546,17 @@ async fn responses(
     let upstream_headers = upstream.headers().clone();
 
     // Forward verbatim, but tee the SSE for token usage so this passthrough —
-    // the path the real Codex CLI uses — is attributed too. Model isn't parsed
-    // here (the body may be many MB); `-` marks "raw passthrough".
-    let mut log = CompletionLog::new(ctx, "/v1/responses", "-", "-", state.metrics.clone());
+    // the path the real Codex CLI uses — is attributed too. The model comes
+    // from the `inspect` scan above (post-alias); `-` = the body had none.
+    let model = observe::truncate(info.model.as_deref().unwrap_or("-"));
+    let metric_model = metric_model_label(&model).to_string();
+    let mut log = CompletionLog::new(
+        ctx,
+        "/v1/responses",
+        model,
+        metric_model,
+        state.metrics.clone(),
+    );
     log.set_account(fwd.account);
     if let Some(key) = &key {
         log.set_affinity(key.source.as_str());
@@ -638,7 +646,7 @@ async fn forward_aux_json(
             return Ok(rejection);
         }
     }
-    let model = info.model.clone().unwrap_or_else(|| "-".into());
+    let model = observe::truncate(info.model.as_deref().unwrap_or("-"));
     let metric_model = metric_model_label(&model).to_string();
     let key = affinity::resolve(headers, info.key);
     let mut log = CompletionLog::new(ctx, path, model, metric_model, state.metrics.clone());
@@ -3214,7 +3222,7 @@ mod tests {
         let _ = body_string(response).await;
         let scraped = scrape(metrics).await;
         for (kind, n) in [("prompt", 1000), ("cached", 800), ("cache_write", 150)] {
-            let needle = format!(r#"kind="{kind}",model="-"}} {n}"#);
+            let needle = format!(r#"kind="{kind}",model="gpt-6-astra"}} {n}"#);
             assert!(scraped.contains(&needle), "missing {needle} in {scraped}");
         }
     }
