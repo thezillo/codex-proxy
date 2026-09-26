@@ -160,6 +160,9 @@ impl PoolEntry {
 pub struct Upstream {
     http: reqwest::Client,
     pool: Vec<PoolEntry>,
+    /// `affinity::fnv1a` of each pool entry's label, in pool order: its
+    /// identity for conversation affinity (see `scan_order`).
+    label_hashes: Vec<u64>,
     /// Round-robin cursor into `pool`. `Relaxed` is enough — entries only
     /// need even distribution across concurrent requests, not a strict order.
     next: AtomicUsize,
@@ -370,6 +373,10 @@ impl Upstream {
             );
         }
         tracing::info!(%responses_url, %user_agent, "upstream configured");
+        let label_hashes = accounts
+            .iter()
+            .map(|(_, label)| crate::affinity::fnv1a(label.as_bytes()))
+            .collect();
         let pool = accounts
             .into_iter()
             .map(|(auth, label)| PoolEntry {
@@ -383,6 +390,7 @@ impl Upstream {
         Self {
             http,
             pool,
+            label_hashes,
             next: AtomicUsize::new(0),
             account_cooldown: Duration::from_secs(cfg.account_cooldown_secs),
             responses_url,
@@ -395,45 +403,49 @@ impl Upstream {
         }
     }
 
-    /// Where a request starts looking in the pool. A request with a
-    /// conversation key (see `crate::affinity`) always starts at the same
-    /// account — its conversation's "home" — so every turn lands on one
-    /// account while it's healthy, and that account's prompt cache keeps
-    /// serving the growing conversation prefix. Keyless requests round-robin
-    /// from a shared cursor. A single-account pool has nothing to choose.
-    fn start_index(&self, affinity: Option<u64>) -> usize {
+    /// The order a request scans the pool in. A request with a conversation
+    /// key (see `crate::affinity`) always gets the same order — its
+    /// conversation's "home" account first, then its own fallbacks (see
+    /// `affinity::rank_accounts`) — so every turn lands on one account while
+    /// it's healthy, and that account's prompt cache keeps serving the
+    /// growing conversation prefix. Keyless requests round-robin from a
+    /// shared cursor. A single-account pool has nothing to choose.
+    fn scan_order(&self, affinity: Option<u64>) -> Vec<usize> {
         let len = self.pool.len();
         if len == 1 {
-            return 0;
+            return vec![0];
         }
         match affinity {
-            Some(hash) => (hash % len as u64) as usize,
-            None => self.next.fetch_add(1, Ordering::Relaxed) % len,
+            Some(hash) => crate::affinity::rank_accounts(hash, &self.label_hashes),
+            None => {
+                let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
+                (0..len).map(|offset| (start + offset) % len).collect()
+            }
         }
     }
 
-    /// Pick the next account to try, scanning the pool in order from
-    /// `start` and skipping any already `tried` this sweep: the most usable
-    /// one by `Availability` (ready, else merely cooling, else quota-held —
-    /// when everything is unavailable, trying a shaky account beats refusing
-    /// the request outright; a caller with somewhere better to send it
-    /// checks `unavailable` first). `min_by_key` keeps the first best in
-    /// scan order, so a healthy pool rotates evenly under round-robin and a
-    /// session stays on its home account under affinity. `None` once every
-    /// account has been tried.
+    /// Pick the next account to try, scanning the pool in `order` and
+    /// skipping any already `tried` this sweep: the most usable one by
+    /// `Availability` (ready, else merely cooling, else quota-held — when
+    /// everything is unavailable, trying a shaky account beats refusing the
+    /// request outright; a caller with somewhere better to send it checks
+    /// `unavailable` first). `min_by_key` keeps the first best in scan order,
+    /// so a healthy pool rotates evenly under round-robin and a session stays
+    /// on its home account under affinity. `None` once every account has been
+    /// tried.
     ///
     /// Returns the pool index too, so a caller that later sees this account
     /// fail can start its cooldown. Returns owned handles for the rest (not
     /// a borrow of `self`) so the caller can `.await` on them freely.
     fn next_account(
         &self,
-        start: usize,
+        order: &[usize],
         tried: &[bool],
     ) -> Option<(usize, Arc<AuthManager>, Arc<str>)> {
         let now = Instant::now();
-        let len = self.pool.len();
-        let idx = (0..len)
-            .map(|offset| (start + offset) % len)
+        let idx = order
+            .iter()
+            .copied()
             .filter(|&i| !tried[i])
             .min_by_key(|&i| self.pool[i].availability(now))?;
         let entry = &self.pool[idx];
@@ -563,10 +575,10 @@ impl Upstream {
         let mut last_response = None;
         let mut last_err: Option<PoolFailure> = None;
 
-        // Chosen once per request: the sweep below walks the pool from here,
-        // each account at most once.
-        let start = self.start_index(affinity);
-        while let Some((idx, auth_mgr, account)) = self.next_account(start, &tried) {
+        // Chosen once per request: the sweep below walks the pool in this
+        // order, each account at most once.
+        let order = self.scan_order(affinity);
+        while let Some((idx, auth_mgr, account)) = self.next_account(&order, &tried) {
             tried[idx] = true;
 
             match self
@@ -1555,7 +1567,7 @@ mod tests {
     async fn a_session_stays_on_its_home_account() {
         let mut fake = start_fake_account_log(8).await;
         let upstream = test_pool(&fake.base_url, 3).await;
-        // "sess-abc" hashes to index 1 of 3 (see the pinned value above).
+        // "sess-abc" ranks account-1 first of 3 (pinned in `crate::affinity`).
         for _ in 0..4 {
             let fwd = upstream
                 .forward_responses(
@@ -1583,9 +1595,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_moves_to_the_next_account_while_home_is_cooling() {
-        // Home (acct-1) throttles once. The session fails over to the next
-        // account in scan order and STAYS there for the cooldown, instead of
-        // bouncing between accounts on every turn.
+        // Home (acct-1) throttles once. The session fails over to its next
+        // account (acct-2, pinned in `crate::affinity`) and STAYS there for
+        // the cooldown, instead of bouncing between accounts on every turn.
         let mut fake = start_scripted_upstream(std::collections::HashMap::from([(
             "acct-1",
             vec![429, 200],
@@ -2352,7 +2364,7 @@ mod tests {
             .all(|s| s.quota.is_none()));
 
         upstream
-            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), Some(0))
+            .forward_responses(bytes::Bytes::from_static(b"{}"), &HeaderMap::new(), None)
             .await
             .unwrap();
         let _ = fake.recv().await;
