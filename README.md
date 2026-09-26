@@ -422,11 +422,17 @@ key is, in order of preference:
    conversations. No similarity matching is involved or needed: prompt
    caching only hits on an exact prefix anyway.
 
-Only requests with none of these (e.g. an empty body) round-robin. If the
-home account fails, the conversation moves to the next account in order and
-stays there until home is usable again. The hash is fixed (FNV-1a), so
-conversations keep their account across restarts; adding or removing an
-account does reshuffle them. A Codex history compaction rewrites the prefix,
+Only requests with none of these (e.g. an empty body) round-robin. The home
+account is picked by rendezvous hashing of the key against each account's
+label, which also gives every conversation its own order of fallback
+accounts. If the home account fails, the conversation moves to its next
+account and stays there until home is usable again; the conversations of one
+failing account spread over the rest of the pool rather than all landing on
+the same neighbour. The hashes are fixed (FNV-1a), so conversations keep
+their account across restarts. Adding or removing an account moves only the
+conversations whose home it becomes or was (about 1/N of them); renaming an
+account's label (`account_names`) moves its conversations like a removal
+plus an addition. A Codex history compaction rewrites the prefix,
 so a derived key changes once at that point. The access log's `affinity`
 field says which of the three the key came from.
 

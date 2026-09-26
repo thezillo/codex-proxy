@@ -192,6 +192,34 @@ impl<'de: 'a, 'a> Deserialize<'de> for FirstElement<'a> {
     }
 }
 
+/// Pool indices in the order a conversation tries them: its home account
+/// first, then its own fallbacks. Rendezvous (highest-random-weight) hashing:
+/// each account scores `mix(conversation ^ account)` and the order is by
+/// score. Unlike `conversation % len`, adding or removing an account only
+/// moves the conversations whose top pick it is (about 1/len of them), and
+/// the conversations of a failing account spread over the rest of the pool
+/// instead of all landing on the one next to it.
+///
+/// `accounts` are stable per-account hashes (of the account's label), so a
+/// conversation's order doesn't depend on where the account sits in the pool.
+pub fn rank_accounts(conversation: u64, accounts: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..accounts.len()).collect();
+    // Descending score; the index breaks a tie (two accounts with one label).
+    order.sort_by_key(|&i| (std::cmp::Reverse(mix(conversation ^ accounts[i])), i));
+    order
+}
+
+/// MurmurHash3's 64-bit finalizer: FNV-1a alone mixes its last bytes only
+/// into the high bits, so labels differing in one trailing character
+/// (`acct-1`, `acct-2`) would score too alike to rank fairly.
+fn mix(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
+}
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -226,6 +254,52 @@ mod tests {
     #[test]
     fn fnv1a_is_pinned_so_conversations_keep_their_account_across_deploys() {
         assert_eq!(fnv1a(b"sess-abc"), 0x7dcf_79c7_f6fa_627e);
+    }
+
+    fn labels(n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|i| fnv1a(format!("account-{i}").as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn rank_accounts_is_pinned_so_conversations_keep_their_account_across_deploys() {
+        assert_eq!(rank_accounts(fnv1a(b"sess-abc"), &labels(3)), [1, 2, 0]);
+    }
+
+    #[test]
+    fn adding_an_account_moves_only_the_conversations_it_takes_over() {
+        let (before, after) = (labels(4), labels(5));
+        let mut moved = 0;
+        for c in 0..10_000u64 {
+            let conversation = fnv1a(&c.to_le_bytes());
+            let old = rank_accounts(conversation, &before)[0];
+            let new = rank_accounts(conversation, &after)[0];
+            if old != new {
+                // Anything that moves, moves to the new account.
+                assert_eq!(new, 4);
+                moved += 1;
+            }
+        }
+        // ~1/5 expected; `% len` would move ~4/5.
+        assert!((1_500..2_500).contains(&moved), "moved {moved}");
+    }
+
+    #[test]
+    fn a_failing_accounts_conversations_spread_over_the_rest() {
+        let accounts = labels(4);
+        let mut fallback = [0usize; 4];
+        for c in 0..10_000u64 {
+            let order = rank_accounts(fnv1a(&c.to_le_bytes()), &accounts);
+            if order[0] == 0 {
+                fallback[order[1]] += 1;
+            }
+        }
+        // Account 0's conversations go to 1, 2 and 3 about equally, not all to 1.
+        assert_eq!(fallback[0], 0);
+        for n in &fallback[1..] {
+            assert!((600..1_100).contains(n), "{fallback:?}");
+        }
     }
 
     #[test]
