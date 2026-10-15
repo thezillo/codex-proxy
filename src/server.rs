@@ -429,17 +429,19 @@ async fn health() -> impl IntoResponse {
 /// Models this proxy advertises AND accepts (see `[models] reject_unknown`),
 /// most capable first (the order is client-visible — pickers render it as
 /// given). Exactly the `visibility: list` entries of the live Codex catalog
-/// (`/backend-api/codex/models`), in its order: the gpt-6 astra/sol/luna trio,
-/// the 5.6 sol/terra/luna trio and gpt-5.5 (verified answering over a ChatGPT
-/// account on 2026-09-23). Older generations the catalog no longer lists
-/// (gpt-5.4, the *-codex models) are refused; so are hidden catalog entries
-/// (`gpt-reserve`, `codex-auto-review`), which aren't advertised. The bare "gpt-6"/"gpt-5.6" names are listed for
+/// (`/backend-api/codex/models`), in its order: gpt-6.1-sol, the gpt-6
+/// astra/sol/luna trio and the 5.6 sol/terra/luna trio. Older generations the
+/// catalog no longer lists (gpt-5.5, gpt-5.4, the *-codex models) are refused;
+/// so are hidden catalog entries (`gpt-reserve`, `codex-auto-review`), which
+/// aren't advertised. The bare "gpt-6.1"/"gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
 /// model aliases — on both POST endpoints, so a client that picks a bare name
 /// out of this very list reaches the subscription pool whichever wire API it
 /// speaks. Both the list and retrieve endpoints derive their output from this
 /// slice.
 const SUPPORTED_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
+    "gpt-6.1",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -448,7 +450,6 @@ const SUPPORTED_MODELS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.6",
-    "gpt-5.5",
 ];
 
 /// One OpenAI-style model object. Mirrors what `/v1/models` returns per entry,
@@ -1179,12 +1180,12 @@ mod tests {
         )
         .unwrap();
         let listed = &list["data"][0];
-        assert_eq!(listed["id"], "gpt-6-astra");
+        assert_eq!(listed["id"], "gpt-6.1-sol");
 
         let retrieved = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/v1/models/gpt-6-astra")
+                    .uri("/v1/models/gpt-6.1-sol")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2957,11 +2958,12 @@ mod tests {
         let pool = start_model_aware_upstream(vec![
             ("gpt-6-sol", StatusCode::OK, "{}"),
             ("gpt-6-luna", StatusCode::OK, "{}"),
+            ("gpt-6.1-sol", StatusCode::OK, "{}"),
         ])
         .await;
         let fallback = start_model_aware_upstream(vec![]).await;
         let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
-        for model in ["gpt-6-sol", "gpt-6-luna"] {
+        for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
             let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
             let response = app
                 .clone()
@@ -2978,7 +2980,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
-        assert_eq!(pool.seen(), ["gpt-6-sol", "gpt-6-luna"]);
+        assert_eq!(pool.seen(), ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"]);
         let listed = app
             .oneshot(
                 HttpRequest::builder()
@@ -2990,6 +2992,7 @@ mod tests {
             .unwrap();
         let listed = body_string(listed).await;
         assert!(listed.contains("gpt-6-sol") && listed.contains("gpt-6-luna"));
+        assert!(listed.contains(r#""gpt-6.1-sol""#) && !listed.contains(r#""gpt-5.5""#));
         assert!(
             !listed.contains("gpt-reserve"),
             "hidden catalog models aren't advertised"
@@ -3003,7 +3006,7 @@ mod tests {
         let pool = start_model_aware_upstream(vec![]).await;
         let fallback = start_model_aware_upstream(vec![]).await;
         let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
-        for model in ["gpt-5.4", "gpt-5.2-codex", "gpt-4o"] {
+        for model in ["gpt-5.5", "gpt-5.4", "gpt-5.2-codex", "gpt-4o"] {
             let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
             let response = app
                 .clone()
