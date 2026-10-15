@@ -646,6 +646,7 @@ mod tests {
         // `{"detail":"The 'gpt-6' model is not supported when using Codex with
         // a ChatGPT account."}`.
         let defaults = DefaultsConfig::default();
+        assert_eq!(resolve_model("gpt-6.1", &defaults), "gpt-6.1-sol");
         assert_eq!(resolve_model("gpt-6", &defaults), "gpt-6-astra");
         assert_eq!(resolve_model("gpt-5.6", &defaults), "gpt-5.6-sol");
         assert_eq!(defaults.model, "gpt-6-astra");

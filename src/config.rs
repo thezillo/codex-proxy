@@ -297,12 +297,12 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 ///
 /// Keep this at or above the highest `minimal_client_version` in the Codex
 /// model catalog for the models we advertise: the catalog gates gpt-6-sol and
-/// gpt-6-luna on 0.155.0 (gpt-6-astra on 0.153.0). The upstream did not
-/// enforce this for gpt-6-astra, but a request for a model no build of that
-/// CLI version could offer is a needless fingerprint — and the live catalog
-/// endpoint itself filters by `client_version`, so an old version also hides
-/// new models from anyone listing them through this identity.
-pub const DEFAULT_CLI_VERSION: &str = "0.155.1";
+/// gpt-6-luna on 0.155.0 (gpt-6-astra on 0.153.0). gpt-6.1-sol claims 0.153.0
+/// but the upstream only lists it to, and only serves it to, 0.160+ clients
+/// (a 0.155.1 request 400s "not supported when using Codex with a ChatGPT
+/// account", verified 2026-10-15) — so `minimal_client_version` alone is not
+/// enough; check the live catalog at the version you intend to impersonate.
+pub const DEFAULT_CLI_VERSION: &str = "0.160.1";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {
@@ -359,6 +359,7 @@ impl Default for DefaultsConfig {
             // wire API, so an alias that only covered the translation path
             // would miss the client that needs it most.
             model_aliases: HashMap::from([
+                ("gpt-6.1".to_string(), "gpt-6.1-sol".to_string()),
                 ("gpt-6".to_string(), "gpt-6-astra".to_string()),
                 ("gpt-5.6".to_string(), "gpt-5.6-sol".to_string()),
             ]),
