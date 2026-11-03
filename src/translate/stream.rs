@@ -459,6 +459,9 @@ pub async fn collect_chat(
     let has_tools = !tool_calls.is_empty();
     if full_text.is_empty() && !has_tools && full_reasoning.is_empty() {
         tracing::warn!("upstream produced no content, tool calls, or reasoning (empty completion)");
+        return Err(ProxyError::EmptyResponse(
+            "upstream produced no content, tool calls, or reasoning".into(),
+        ));
     }
     let mut message = json!({
         "role": "assistant",
@@ -585,7 +588,7 @@ impl SseUsageScanner {
 
 /// First SSE event delimiter in `buf`, returning `(offset, delimiter_len)`.
 /// Handles both `\n\n` (LF) and `\r\n\r\n` (CRLF) line endings.
-fn find_event_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_event_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
     let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
     let crlf = buf
         .windows(4)
@@ -600,7 +603,7 @@ fn find_event_delimiter(buf: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Concatenate the `data:` lines of one SSE block into a single payload string.
-fn extract_data(block: &str) -> Option<String> {
+pub(crate) fn extract_data(block: &str) -> Option<String> {
     let mut data = String::new();
     let mut found = false;
     for line in block.lines() {

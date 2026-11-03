@@ -123,6 +123,12 @@ pub struct ClientKey {
     /// name instead of an opaque fingerprint (`key-XXXXXXXX`).
     #[serde(default)]
     pub name: Option<String>,
+    /// Pool only: never the paid `[[fallback]]` chain, never a model
+    /// downgrade, and a 503 `pool_unavailable` without an upstream call when
+    /// every pool account is quota-held or cooling. For a caller that runs
+    /// its own fallback and spend accounting.
+    #[serde(default)]
+    pub pool_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -310,6 +316,7 @@ impl Default for ClientAuthConfig {
             keys: vec![ClientKey {
                 key: DEFAULT_CLIENT_KEY.to_string(),
                 name: None,
+                pool_only: false,
             }],
             require: true,
         }
@@ -431,7 +438,11 @@ impl Config {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .map(|key| ClientKey { key, name: None })
+                .map(|key| ClientKey {
+                    key,
+                    name: None,
+                    pool_only: false,
+                })
                 .collect();
         }
         if let Ok(v) = std::env::var("CODEXPROXY_DATA_DIR") {
@@ -577,6 +588,26 @@ mod tests {
                 "alias target {target} would be rejected"
             );
         }
+    }
+
+    #[test]
+    fn client_key_pool_only_defaults_to_false() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[client_auth.keys]]
+            key = "sk-a"
+
+            [[client_auth.keys]]
+            key = "sk-gw"
+            name = "ai-gateway"
+            pool_only = true
+            "#,
+        )
+        .expect("config parses");
+        let keys = &cfg.client_auth.keys;
+        assert!(!keys[0].pool_only);
+        assert!(keys[1].pool_only);
+        assert_eq!(keys[1].name.as_deref(), Some("ai-gateway"));
     }
 
     #[test]

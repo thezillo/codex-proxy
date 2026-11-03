@@ -23,6 +23,7 @@ use crate::config::{ClientKey, Config};
 use crate::embeddings::EmbeddingsUpstream;
 use crate::error::ProxyError;
 use crate::fallback::FallbackChain;
+use crate::lookahead;
 use crate::metrics::{Metrics, TokenUsage};
 use crate::observe::{self, AccessCtx, CompletionLog};
 use crate::translate::{
@@ -81,6 +82,11 @@ impl AppState {
         key: Option<&ConversationKey>,
     ) -> Result<ForwardedResponse, ProxyError> {
         let affinity = key.map(|k| k.hash);
+        if ctx.pool_only {
+            return self
+                .forward_pool_only(body, client_headers, ctx, model, affinity)
+                .await;
+        }
         // Quota-aware short-circuit: when every pool account is known to be
         // unusable right now (quota-exhausted, or cooling down after a
         // failure) and there is somewhere else to send the request, don't
@@ -100,8 +106,7 @@ impl AppState {
         let pool_result = match skip_reason {
             Some(failure) => Err(failure),
             None => match self
-                .upstream
-                .forward_responses(body.clone(), client_headers, affinity)
+                .forward_pool(body.clone(), client_headers, affinity)
                 .await
             {
                 Ok(fwd) if fwd.response.status().is_success() => return Ok(fwd),
@@ -196,13 +201,77 @@ impl AppState {
             None if pool_skipped => {
                 // The chain declined and the pool was never tried: give the
                 // pool its normal chance, unavailable or not.
-                self.upstream
-                    .forward_responses(body, client_headers, affinity)
+                self.forward_pool(body, client_headers, affinity)
                     .await
                     .map_err(ProxyError::from)
             }
             None => pool_result.map_err(ProxyError::from),
         }
+    }
+
+    /// `Upstream::forward_responses` plus the first-output lookahead (see
+    /// `crate::lookahead`): a 2xx stream that fails or ends before any output
+    /// comes back as the 5xx it really is, so every rule below sees it as a
+    /// failed pool response.
+    async fn forward_pool(
+        &self,
+        body: bytes::Bytes,
+        client_headers: &HeaderMap,
+        affinity: Option<u64>,
+    ) -> Result<ForwardedResponse, crate::upstream::PoolFailure> {
+        let fwd = self
+            .upstream
+            .forward_responses(body, client_headers, affinity)
+            .await?;
+        if !fwd.response.status().is_success() {
+            return Ok(fwd);
+        }
+        let checked = lookahead::check_first_output(
+            fwd.response,
+            &fwd.account,
+            self.config.server.max_body_bytes,
+            std::time::Duration::from_secs(self.config.upstream.request_timeout_secs),
+        )
+        .await;
+        Ok(ForwardedResponse {
+            response: checked.response,
+            account: fwd.account,
+            reason: checked.reason,
+        })
+    }
+
+    /// `forward_with_fallback` for a `pool_only` client: the pool's own final
+    /// response, whatever its status, and no downgrade or paid fallback. A
+    /// pool known to be unusable answers 503 without an upstream round-trip,
+    /// so the caller can move on to its own fallback at once.
+    async fn forward_pool_only(
+        &self,
+        body: bytes::Bytes,
+        client_headers: &HeaderMap,
+        ctx: &AccessCtx,
+        model: Option<&str>,
+        affinity: Option<u64>,
+    ) -> Result<ForwardedResponse, ProxyError> {
+        if let Some(failure) = self.upstream.unavailable() {
+            self.metrics
+                .record_rejected(&ctx.client, "pool_unavailable");
+            tracing::warn!(
+                target: "access",
+                client = %ctx.client,
+                model = %observe::truncate(model.unwrap_or("-")),
+                reason = failure.reason.as_str(),
+                account = %failure.account.as_deref().unwrap_or("-"),
+                "pool unavailable; answered 503 to a pool_only client"
+            );
+            let message = match failure.error {
+                ProxyError::Upstream(message) => message,
+                other => other.to_string(),
+            };
+            return Err(ProxyError::PoolUnavailable(message));
+        }
+        self.forward_pool(body, client_headers, affinity)
+            .await
+            .map_err(ProxyError::from)
     }
 
     /// Walk `[models.downgrades]` from the body's model, retrying the pool
@@ -241,8 +310,7 @@ impl AppState {
             seen.push(next.clone());
             let lowered = rewrite_model(body, &original, next)?;
             let result = self
-                .upstream
-                .forward_responses(lowered.into(), client_headers, affinity)
+                .forward_pool(lowered.into(), client_headers, affinity)
                 .await;
             let served = matches!(&result, Ok(fwd) if fwd.response.status().is_success());
             self.metrics.record_downgrade(
@@ -400,7 +468,7 @@ async fn require_client_auth(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ProxyError> {
-    let client = check_client_auth(&config, &headers)?;
+    let (client, pool_only) = check_client_auth(&config, &headers)?;
     let ip = observe::client_ip(&headers);
 
     // Start line: answers "who is calling, from where" for *every* protected
@@ -418,7 +486,11 @@ async fn require_client_auth(
 
     // Hand the attribution to the handler so its completion line (model, tokens,
     // status, duration) carries the same client/ip.
-    request.extensions_mut().insert(AccessCtx { client, ip });
+    request.extensions_mut().insert(AccessCtx {
+        client,
+        ip,
+        pool_only,
+    });
     Ok(next.run(request).await)
 }
 
@@ -801,7 +873,13 @@ async fn chat_completions(
                     .into_response()
             }))
     } else {
-        let json = collect_chat(upstream, echo_model, defaults, max_event_bytes).await?;
+        let json = match collect_chat(upstream, echo_model, defaults, max_event_bytes).await {
+            Ok(json) => json,
+            Err(e) => {
+                log.emit(e.status().as_u16(), None);
+                return Err(e);
+            }
+        };
         log.emit(StatusCode::OK.as_u16(), usage_pair(&json));
         Ok(Json(json).into_response())
     }
@@ -832,6 +910,19 @@ async fn embeddings(
     Extension(ctx): Extension<AccessCtx>,
     body: bytes::Bytes,
 ) -> Result<Response, ProxyError> {
+    // Served only by a paid provider, so off limits whether configured or not.
+    if ctx.pool_only {
+        state.metrics.record_rejected(&ctx.client, "pool_only");
+        tracing::warn!(
+            target: "access",
+            client = %ctx.client,
+            endpoint = EMBEDDINGS_ENDPOINT,
+            "embeddings refused to a pool_only client"
+        );
+        return Err(ProxyError::PoolOnly(
+            "embeddings are served by a paid provider, not the subscription pool".into(),
+        ));
+    }
     let Some(upstream) = state.embeddings.as_ref() else {
         return Err(ProxyError::NotFound(
             "embeddings are not configured on this proxy: add an [embeddings] section \
@@ -977,11 +1068,12 @@ async fn passthrough_response(upstream: reqwest::Response, max_body_bytes: usize
 
 /// Validate the client's `Authorization: Bearer <key>` against the configured
 /// key list and return a non-secret label for the matched key (configured name
-/// or fingerprint), used to attribute token spend in the access log. When
-/// `client_auth.require = false`, auth is skipped and everyone is `anonymous`.
-fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<String, ProxyError> {
+/// or fingerprint), used to attribute token spend in the access log, plus
+/// the key's `pool_only`. When `client_auth.require = false`, auth is skipped
+/// and everyone is `anonymous`, not pool_only.
+fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<(String, bool), ProxyError> {
     if !config.client_auth.require {
-        return Ok("anonymous".to_string());
+        return Ok(("anonymous".to_string(), false));
     }
 
     let presented = headers
@@ -992,7 +1084,10 @@ fn check_client_auth(config: &Config, headers: &HeaderMap) -> Result<String, Pro
 
     match presented {
         Some(key) => match key_matches(&config.client_auth.keys, key) {
-            Some(matched) => Ok(observe::key_label(key, matched.name.as_deref())),
+            Some(matched) => Ok((
+                observe::key_label(key, matched.name.as_deref()),
+                matched.pool_only,
+            )),
             None => Err(ProxyError::Unauthorized("invalid API key".into())),
         },
         None => Err(ProxyError::Unauthorized(
@@ -1088,6 +1183,16 @@ mod tests {
         ClientKey {
             key: key.to_string(),
             name: None,
+            pool_only: false,
+        }
+    }
+
+    /// The ai-gateway shape: named, `pool_only`.
+    fn pool_only_key() -> ClientKey {
+        ClientKey {
+            key: "pool-key".to_string(),
+            name: Some("gw".to_string()),
+            pool_only: true,
         }
     }
 
@@ -1464,8 +1569,16 @@ mod tests {
     /// `[[fallback]]` provider `fb` at `provider_base_url`, and `[embeddings]`
     /// routed to it. Returns the metrics too, so tests can read the labels.
     fn test_router_with_embeddings(provider_base_url: String) -> (axum::Router, Arc<Metrics>) {
+        test_router_with_embeddings_and_keys(provider_base_url, vec![])
+    }
+
+    fn test_router_with_embeddings_and_keys(
+        provider_base_url: String,
+        extra_keys: Vec<ClientKey>,
+    ) -> (axum::Router, Arc<Metrics>) {
         let mut config = Config::default();
         config.client_auth.keys = vec![bare_key("test-key")];
+        config.client_auth.keys.extend(extra_keys);
         config.upstream.base_url = provider_base_url.clone();
         config.fallback = vec![fallback_provider_cfg("fb", &provider_base_url)];
         config.embeddings = Some(crate::config::EmbeddingsConfig {
@@ -2416,6 +2529,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_clamps_an_unrecognized_client_supplied_model() {
         let upstream_body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
             "data: [DONE]\n\n"
         );
@@ -3228,5 +3342,357 @@ mod tests {
             let needle = format!(r#"kind="{kind}",model="gpt-6-astra"}} {n}"#);
             assert!(scraped.contains(&needle), "missing {needle} in {scraped}");
         }
+    }
+
+    // ---- pool_only clients ----
+
+    /// `guarded_config` plus the pool_only `pool-key` next to `test-key`.
+    fn pool_only_router(
+        pool_url: &str,
+        fallback_url: &str,
+        cooldown_secs: u64,
+    ) -> (axum::Router, Arc<Metrics>) {
+        let mut config = guarded_config(pool_url, fallback_url, cooldown_secs);
+        config.client_auth.keys.push(pool_only_key());
+        guarded_router(config)
+    }
+
+    fn request_as(uri: &'static str, bearer: &str, body: &'static str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pool_only_client_gets_the_pool_429_without_downgrade_or_fallback() {
+        let pool = start_model_aware_upstream(vec![
+            ("gpt-6-astra", StatusCode::TOO_MANY_REQUESTS, THROTTLE_429),
+            ("gpt-5.6-sol", StatusCode::OK, r#"{"ok":"sol"}"#),
+        ])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "astra-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, _) = pool_only_router(&pool.base_url, &fallback.base_url, 0);
+
+        let response = app
+            .oneshot(request_as(
+                "/v1/responses",
+                "pool-key",
+                r#"{"model":"gpt-6-astra","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_string(response).await, THROTTLE_429);
+        assert_eq!(pool.seen(), ["gpt-6-astra"], "no downgrade");
+        assert!(fallback.seen().is_empty(), "no paid fallback");
+    }
+
+    #[tokio::test]
+    async fn normal_client_on_the_same_proxy_still_falls_back() {
+        let pool = start_model_aware_upstream(vec![(
+            "gpt-6-astra",
+            StatusCode::TOO_MANY_REQUESTS,
+            THROTTLE_429,
+        )])
+        .await;
+        let fallback = start_model_aware_upstream(vec![(
+            "astra-on-fallback",
+            StatusCode::OK,
+            r#"{"ok":"fb"}"#,
+        )])
+        .await;
+        let (app, _) = pool_only_router(&pool.base_url, &fallback.base_url, 0);
+
+        let response = app
+            .oneshot(responses_request(r#"{"model":"gpt-6-astra","input":"hi"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, r#"{"ok":"fb"}"#);
+        assert_eq!(pool.seen(), ["gpt-6-astra", "gpt-5.6-sol"]);
+        assert_eq!(fallback.seen(), ["astra-on-fallback"]);
+    }
+
+    #[tokio::test]
+    async fn pool_only_client_gets_503_pool_unavailable_without_an_upstream_call() {
+        let pool = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna",
+            StatusCode::TOO_MANY_REQUESTS,
+            THROTTLE_429,
+        )])
+        .await;
+        let fallback = start_model_aware_upstream(vec![]).await;
+        // 30s cooldown: after the first 429 the lone account is cooling.
+        let (app, metrics) = pool_only_router(&pool.base_url, &fallback.base_url, 30);
+
+        let first = app
+            .clone()
+            .oneshot(request_as(
+                "/v1/responses",
+                "pool-key",
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        for (uri, body) in [
+            ("/v1/responses", r#"{"model":"gpt-5.6-luna","input":"hi"}"#),
+            (
+                "/v1/chat/completions",
+                r#"{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_as(uri, "pool-key", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["type"], "server_error");
+            assert_eq!(body["error"]["code"], "pool_unavailable");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cooling down"));
+        }
+        assert_eq!(
+            pool.seen().len(),
+            1,
+            "no upstream round-trip once unavailable"
+        );
+        assert!(fallback.seen().is_empty());
+        let scraped = scrape(metrics).await;
+        assert!(
+            scraped.contains(r#"client="gw",reason="pool_unavailable"} 2"#),
+            "{scraped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_only_client_is_refused_embeddings() {
+        let mut fake = start_fake_upstream(StatusCode::OK, "application/json", EMBEDDINGS_OK).await;
+        let (app, metrics) =
+            test_router_with_embeddings_and_keys(fake.base_url.clone(), vec![pool_only_key()]);
+        let response = app
+            .oneshot(request_as(
+                EMBEDDINGS_ENDPOINT,
+                "pool-key",
+                r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "pool_only");
+        assert!(fake.rx.try_recv().is_err(), "provider must not be called");
+        let scraped = scrape(metrics).await;
+        assert!(scraped.contains(r#"reason="pool_only""#), "{scraped}");
+    }
+
+    // ---- first-output lookahead on the pool's stream ----
+
+    const OVERLOADED_SSE: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    const EMPTY_SSE: &str = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+    );
+    const OK_SSE: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"from-fallback\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    );
+    const MIDSTREAM_ERROR_SSE: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+
+    /// A pool or fallback that always answers `body` as SSE, counting hits.
+    async fn start_sse_upstream(
+        body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = {
+            let hits = hits.clone();
+            move || {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/codex/responses", post(handler.clone()))
+            .route("/responses", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    const CHAT_STREAM: &str =
+        r#"{"model":"gpt-5.6-luna","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    const CHAT_BUFFERED: &str =
+        r#"{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}]}"#;
+
+    #[tokio::test]
+    async fn overloaded_first_event_is_a_503_for_a_pool_only_client() {
+        let (pool_url, pool_hits) = start_sse_upstream(OVERLOADED_SSE).await;
+        let (fb_url, fb_hits) = start_sse_upstream(OK_SSE).await;
+        let (app, _) = pool_only_router(&pool_url, &fb_url, 0);
+
+        for body in [CHAT_STREAM, CHAT_BUFFERED] {
+            let response = app
+                .clone()
+                .oneshot(request_as("/v1/chat/completions", "pool-key", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "upstream_overloaded");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("overloaded"));
+        }
+        assert_eq!(hits(&pool_hits), 2);
+        assert_eq!(hits(&fb_hits), 0, "no paid fallback for pool_only");
+    }
+
+    #[tokio::test]
+    async fn overloaded_first_event_falls_back_for_a_normal_client() {
+        let (pool_url, pool_hits) = start_sse_upstream(OVERLOADED_SSE).await;
+        let (fb_url, fb_hits) = start_sse_upstream(OK_SSE).await;
+        let (app, metrics) = pool_only_router(&pool_url, &fb_url, 0);
+
+        let response = app
+            .clone()
+            .oneshot(post_json("/v1/chat/completions", CHAT_STREAM))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_string(response).await;
+        assert!(text.contains("from-fallback"), "{text}");
+        assert!(!text.contains("[error]"), "{text}");
+
+        let response = app
+            .oneshot(post_json("/v1/chat/completions", CHAT_BUFFERED))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "from-fallback");
+
+        assert_eq!(hits(&pool_hits), 2);
+        assert_eq!(hits(&fb_hits), 2);
+        let scraped = scrape(metrics).await;
+        assert!(scraped.contains(r#"reason="capacity""#), "{scraped}");
+    }
+
+    #[tokio::test]
+    async fn empty_pool_stream_is_a_502() {
+        let (pool_url, _) = start_sse_upstream(EMPTY_SSE).await;
+        let (fb_url, fb_hits) = start_sse_upstream(OK_SSE).await;
+        let (app, _) = pool_only_router(&pool_url, &fb_url, 0);
+
+        for body in [CHAT_STREAM, CHAT_BUFFERED] {
+            let response = app
+                .clone()
+                .oneshot(request_as("/v1/chat/completions", "pool-key", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(json_body(response).await["error"]["code"], "empty_response");
+        }
+        assert_eq!(hits(&fb_hits), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_buffered_completion_from_a_fallback_is_a_502_too() {
+        // The pool 429s, the fallback answers an empty stream; nothing looks
+        // ahead on fallback streams, so `collect_chat` itself refuses it.
+        let pool = start_model_aware_upstream(vec![(
+            "gpt-5.6-luna",
+            StatusCode::TOO_MANY_REQUESTS,
+            THROTTLE_429,
+        )])
+        .await;
+        let (fb_url, _) = start_sse_upstream(EMPTY_SSE).await;
+        let (app, _) = pool_only_router(&pool.base_url, &fb_url, 0);
+        let response = app
+            .oneshot(post_json("/v1/chat/completions", CHAT_BUFFERED))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(json_body(response).await["error"]["code"], "empty_response");
+    }
+
+    #[tokio::test]
+    async fn error_after_output_keeps_the_in_band_error_chunk() {
+        let (pool_url, _) = start_sse_upstream(MIDSTREAM_ERROR_SSE).await;
+        let (fb_url, fb_hits) = start_sse_upstream(OK_SSE).await;
+        let (app, _) = pool_only_router(&pool_url, &fb_url, 0);
+
+        let response = app
+            .oneshot(post_json("/v1/chat/completions", CHAT_STREAM))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_string(response).await;
+        assert!(text.contains("partial"), "{text}");
+        assert!(
+            text.contains("[error] Our servers are currently overloaded"),
+            "{text}"
+        );
+        assert_eq!(hits(&fb_hits), 0, "committed output is never re-run");
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_also_looks_ahead() {
+        let (pool_url, _) = start_sse_upstream(OVERLOADED_SSE).await;
+        let (fb_url, _) = start_sse_upstream(OK_SSE).await;
+        let (app, _) = pool_only_router(&pool_url, &fb_url, 0);
+
+        let response = app
+            .clone()
+            .oneshot(request_as(
+                "/v1/responses",
+                "pool-key",
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = app
+            .oneshot(responses_request(
+                r#"{"model":"gpt-5.6-luna","input":"hi"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, OK_SSE);
     }
 }
