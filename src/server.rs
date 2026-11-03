@@ -609,19 +609,10 @@ async fn responses(
         }
     }
     let key = affinity::resolve(&headers, info.key);
-    let fwd = state
-        .forward_with_fallback(body, &headers, &ctx, info.model.as_deref(), key.as_ref())
-        .await?;
-    let upstream = fwd.response;
-
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    // Captured before `tee_responses` consumes `upstream` below.
-    let upstream_headers = upstream.headers().clone();
-
     // Forward verbatim, but tee the SSE for token usage so this passthrough —
     // the path the real Codex CLI uses — is attributed too. The model comes
     // from the `inspect` scan above (post-alias); `-` = the body had none.
+    // Started before forwarding, so the duration covers the first-output wait.
     let model = observe::truncate(info.model.as_deref().unwrap_or("-"));
     let metric_model = metric_model_label(&model).to_string();
     let mut log = CompletionLog::new(
@@ -631,6 +622,21 @@ async fn responses(
         metric_model,
         state.metrics.clone(),
     );
+    let fwd = state
+        .forward_with_fallback(
+            body,
+            &headers,
+            log.ctx(),
+            info.model.as_deref(),
+            key.as_ref(),
+        )
+        .await?;
+    let upstream = fwd.response;
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // Captured before `tee_responses` consumes `upstream` below.
+    let upstream_headers = upstream.headers().clone();
     log.set_account(fwd.account);
     if let Some(key) = &key {
         log.set_affinity(key.source.as_str());
