@@ -110,6 +110,10 @@ pub async fn check_first_output(
                 )
             }
             Ok(None) => break end_of_stream(&scan),
+            // The client's own read_timeout can fire before the deadline above.
+            Ok(Some(Err(e))) if e.is_timeout() => {
+                break Event::Failed(Failure::Timeout, format!("upstream stream read: {e}"))
+            }
             Ok(Some(Err(e))) => {
                 break Event::Failed(Failure::Error, format!("upstream stream read: {e}"))
             }
@@ -181,15 +185,37 @@ pub async fn check_first_output(
     }
 }
 
-/// A last event the upstream sent without its trailing blank line still
-/// counts; otherwise the stream simply produced nothing.
+/// A last event sent without its trailing blank line counts only as an
+/// error: the chat translators drop such an event, so output in it would
+/// never reach the client.
 fn end_of_stream(rest: &[u8]) -> Event {
     match classify_block(rest) {
-        Event::Metadata => Event::Failed(
+        failed @ Event::Failed(..) => failed,
+        _ => Event::Failed(
             Failure::Empty,
             "upstream stream ended without producing any output".into(),
         ),
-        decided => decided,
+    }
+}
+
+fn nonempty(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+}
+
+/// Whether an output item carries something for the client: a message with
+/// text (or a refusal), any non-reasoning item such as a function call.
+fn item_has_output(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") | None => false,
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|p| nonempty(p.get("text")) || nonempty(p.get("refusal")))
+            }),
+        Some(_) => true,
     }
 }
 
@@ -216,11 +242,7 @@ fn classify(evt: &Value) -> Event {
             let produced = evt
                 .pointer("/response/output")
                 .and_then(Value::as_array)
-                .is_some_and(|items| {
-                    items
-                        .iter()
-                        .any(|i| i.get("type").and_then(Value::as_str) != Some("reasoning"))
-                });
+                .is_some_and(|items| items.iter().any(item_has_output));
             if produced {
                 Event::Output
             } else {
@@ -235,16 +257,14 @@ fn classify(evt: &Value) -> Event {
             Some("message" | "reasoning") | None => Event::Metadata,
             Some(_) => Event::Output,
         },
-        "response.output_item.done" => match item_type() {
-            Some("reasoning") | None => Event::Metadata,
-            Some(_) => Event::Output,
+        "response.output_item.done" => match evt.get("item") {
+            Some(item) if item_has_output(item) => Event::Output,
+            _ => Event::Metadata,
         },
-        t if t.ends_with(".delta")
-            || t == "response.output_text.done"
-            || t == "response.function_call_arguments.done" =>
-        {
-            Event::Output
-        }
+        // An empty delta or text commits nothing yet.
+        t if t.ends_with(".delta") && nonempty(evt.get("delta")) => Event::Output,
+        "response.output_text.done" if nonempty(evt.get("text")) => Event::Output,
+        "response.function_call_arguments.done" => Event::Output,
         _ => Event::Metadata,
     }
 }
@@ -403,6 +423,41 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(reason, None);
         assert_eq!(body, BODY);
+    }
+
+    #[tokio::test]
+    async fn empty_deltas_and_messages_are_not_output() {
+        let (status, reason, _) = check(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded.\"}\n\n",
+        ))
+        .await;
+        assert_eq!(status, 503);
+        assert_eq!(reason, Some(FailureReason::Capacity));
+
+        let (status, _, _) = check(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[]}]}}\n\n",
+        )
+        .await;
+        assert_eq!(status, 502);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_last_event_is_not_output() {
+        // The chat translators drop it, so the client would get nothing.
+        let (status, reason, _) =
+            check("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}").await;
+        assert_eq!(status, 502);
+        assert_eq!(reason, Some(FailureReason::EmptyResponse));
+
+        let (status, _, _) = check(
+            "data: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded.\"}",
+        )
+        .await;
+        assert_eq!(status, 503);
     }
 
     #[tokio::test]
