@@ -501,7 +501,7 @@ async fn health() -> impl IntoResponse {
 /// Models this proxy advertises AND accepts (see `[models] reject_unknown`),
 /// most capable first (the order is client-visible — pickers render it as
 /// given). Exactly the `visibility: list` entries of the live Codex catalog
-/// (`/backend-api/codex/models`), in its order: gpt-6.1-sol, the gpt-6
+/// (`/backend-api/codex/models`), by family: gpt-6.1 sol/terra, the gpt-6
 /// astra/sol/luna trio and the 5.6 sol/terra/luna trio. Older generations the
 /// catalog no longer lists (gpt-5.5, gpt-5.4, the *-codex models) are refused;
 /// so are hidden catalog entries (`gpt-reserve`, `codex-auto-review`), which
@@ -513,6 +513,7 @@ async fn health() -> impl IntoResponse {
 /// slice.
 const SUPPORTED_MODELS: &[&str] = &[
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6.1",
     "gpt-6-astra",
     "gpt-6-sol",
@@ -3073,11 +3074,12 @@ mod tests {
             ("gpt-6-sol", StatusCode::OK, "{}"),
             ("gpt-6-luna", StatusCode::OK, "{}"),
             ("gpt-6.1-sol", StatusCode::OK, "{}"),
+            ("gpt-6.1-terra", StatusCode::OK, "{}"),
         ])
         .await;
         let fallback = start_model_aware_upstream(vec![]).await;
         let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
-        for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
+        for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] {
             let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
             let response = app
                 .clone()
@@ -3094,7 +3096,10 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
-        assert_eq!(pool.seen(), ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"]);
+        assert_eq!(
+            pool.seen(),
+            ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"]
+        );
         let listed = app
             .oneshot(
                 HttpRequest::builder()

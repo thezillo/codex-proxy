@@ -308,7 +308,8 @@ pub const DEFAULT_CLIENT_KEY: &str = "sk-local-changeme";
 /// (a 0.155.1 request 400s "not supported when using Codex with a ChatGPT
 /// account", verified 2026-10-15) — so `minimal_client_version` alone is not
 /// enough; check the live catalog at the version you intend to impersonate.
-pub const DEFAULT_CLI_VERSION: &str = "0.160.1";
+/// gpt-6.1-terra is in the bundled catalog from 0.166.0 (codex-rs/models-manager/models.json).
+pub const DEFAULT_CLI_VERSION: &str = "0.166.0";
 
 impl Default for ClientAuthConfig {
     fn default() -> Self {

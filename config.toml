@@ -82,8 +82,9 @@ originator = "codex_cli_rs"
 # fingerprint the proxy. Bump to match the real Codex CLI, or override with
 # CODEXPROXY_CLI_VERSION. Keep it >= the highest `minimal_client_version` of
 # the models below (gpt-6-sol/gpt-6-luna want 0.155.0) — and note the upstream
-# serves gpt-6.1-sol only to 0.160+ despite its catalog entry saying 0.153.0.
-cli_version = "0.160.1"
+# serves gpt-6.1-sol only to 0.160+ despite its catalog entry saying 0.153.0;
+# gpt-6.1-terra is in the bundled catalog from 0.166.0.
+cli_version = "0.166.0"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600
