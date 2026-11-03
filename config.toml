@@ -31,6 +31,10 @@ require = true
 # Generate a digest with: printf '%s' 'the-real-key' | shasum -a 256
 # `name` is optional; without it, access logs show a non-reversible
 # fingerprint (`key-XXXXXXXX`) instead of a label.
+# `pool_only = true` keeps a client on the ChatGPT pool: no [[fallback]], no
+# [models.downgrades], a 503 `pool_unavailable` when every account is
+# quota-held or cooling, and /v1/embeddings refused with 403. For a caller
+# with its own fallback chain and spend accounting.
 
 [[client_auth.keys]]
 key = "sk-local-changeme" # placeholder — generate your own before deploying
@@ -42,6 +46,11 @@ key = "sk-local-changeme" # placeholder — generate your own before deploying
 # [[client_auth.keys]]
 # key = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
 # name = "alice-laptop"
+
+# [[client_auth.keys]]
+# key = "sk-ai-gateway"
+# name = "ai-gateway"
+# pool_only = true
 
 [upstream]
 # Where Codex credentials live. `codex login` writes auth.json directly here
@@ -73,8 +82,9 @@ originator = "codex_cli_rs"
 # fingerprint the proxy. Bump to match the real Codex CLI, or override with
 # CODEXPROXY_CLI_VERSION. Keep it >= the highest `minimal_client_version` of
 # the models below (gpt-6-sol/gpt-6-luna want 0.155.0) — and note the upstream
-# serves gpt-6.1-sol only to 0.160+ despite its catalog entry saying 0.153.0.
-cli_version = "0.160.1"
+# serves gpt-6.1-sol only to 0.160+ despite its catalog entry saying 0.153.0;
+# gpt-6.1-terra is in the bundled catalog from 0.166.0.
+cli_version = "0.166.0"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600

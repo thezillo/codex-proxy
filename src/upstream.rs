@@ -265,6 +265,9 @@ pub enum FailureReason {
     /// The pool was never tried: every account is inside its short
     /// post-failure cooldown and a fallback chain exists.
     CoolingDown,
+    /// A 2xx stream that ended before producing any output (see
+    /// `crate::lookahead`).
+    EmptyResponse,
     Unknown,
 }
 
@@ -280,6 +283,7 @@ impl FailureReason {
             FailureReason::Transport => "transport",
             FailureReason::QuotaExhausted => "quota_exhausted",
             FailureReason::CoolingDown => "cooling_down",
+            FailureReason::EmptyResponse => "empty_response",
             FailureReason::Unknown => "unknown",
         }
     }

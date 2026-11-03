@@ -33,6 +33,8 @@ use crate::upstream::FailureReason;
 pub struct AccessCtx {
     pub client: String,
     pub ip: String,
+    /// The matched key's `pool_only` (see `ClientKey`).
+    pub pool_only: bool,
 }
 
 /// Non-reversible 32-bit fingerprint of a key (FNV-1a, low 32 bits), rendered
@@ -265,6 +267,7 @@ mod tests {
         let ctx = AccessCtx {
             client: "alice".to_string(),
             ip: "1.2.3.4".to_string(),
+            pool_only: false,
         };
         let mut log = CompletionLog::new(
             ctx,
@@ -295,6 +298,7 @@ mod tests {
         let ctx = AccessCtx {
             client: "bob".to_string(),
             ip: "5.6.7.8".to_string(),
+            pool_only: false,
         };
         let mut log = CompletionLog::new(
             ctx,

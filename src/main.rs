@@ -8,6 +8,7 @@ mod config;
 mod embeddings;
 mod error;
 mod fallback;
+mod lookahead;
 mod metrics;
 mod observe;
 mod replay;

@@ -78,6 +78,11 @@ name = "alice"
 key = "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
 name = "bob"
 
+[[client_auth.keys]]
+key = "sk-gateway-..."
+name = "ai-gateway"
+pool_only = true                # see "Pool-only clients"
+
 [logging]
 level = "info"
 format = "json"
@@ -134,7 +139,7 @@ Anything settable by env is also settable in the file; the reverse isn't true.
 | `CODEXPROXY_API_KEYS` | `client_auth.keys` | `sk-local-changeme` placeholder |
 | `CODEXPROXY_DATA_DIR` | `upstream.data_dir` | `~/.codex` |
 | `CODEXPROXY_AUTH_JSON` | — (seed, not config) | unset |
-| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.160.1` |
+| `CODEXPROXY_CLI_VERSION` | `upstream.cli_version` | `0.166.0` |
 | `CODEXPROXY_PROXY` | `upstream.proxy` | unset (direct) |
 | `CODEXPROXY_LOG` | `logging.level` | `info` |
 | `CODEXPROXY_LOG_FORMAT` | `logging.format` | `text` |
@@ -239,7 +244,7 @@ in the logs, it's one of these three — the message names which.
 
 `/health` and the model endpoints need no auth (so they work as container
 probes); all `/v1` POST endpoints do. Advertised (and, by default, the only
-accepted) models: `gpt-6.1-sol`, `gpt-6.1`, `gpt-6-astra`, `gpt-6-sol`,
+accepted) models: `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.1`, `gpt-6-astra`, `gpt-6-sol`,
 `gpt-6-luna`, `gpt-6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`,
 `gpt-5.6` — the listed entries of the live Codex model catalog. Older
 generations the catalog no longer lists (e.g. `gpt-5.5`, `gpt-5.4`) are
@@ -307,7 +312,9 @@ pool failed, served by fallback provider  client=alice ip=1.2.3.4 request_id=...
 
 - `reason` is a normalized category, so it can be grouped on: `rate_limit`,
   `auth`, `timeout`, `capacity`, `upstream_5xx`, `bad_request`, `transport`,
-  `quota_exhausted`, `cooling_down`, `unknown`. `quota_exhausted` is a
+  `quota_exhausted`, `cooling_down`, `empty_response`, `unknown`.
+  `empty_response` is a pool stream that ended without output (see Stream
+  lookahead below). `quota_exhausted` is a
   `usage_limit_reached` 429 — either the request that discovered it
   (`status=429`) or one diverted straight to the chain afterwards because
   every account is under such a hold (`status=0`); `cooling_down` is always
@@ -361,7 +368,9 @@ disables the metrics server without disabling collection.
 - `codexproxy_model_downgrades_total{client, from, to, outcome}` — in-pool
   retries with a lower model, `outcome` is `served` or `failed`
 - `codexproxy_rejected_requests_total{client, reason}` — requests refused
-  instead of paid for: `unknown_model` or `pool_bad_request`
+  instead of paid for: `unknown_model`, `pool_bad_request`, and for
+  `pool_only` clients `pool_unavailable` (503 without an upstream call) or
+  `pool_only` (`/v1/embeddings` refused)
 
 Per pool account (`account` is the same label as above), read live at
 scrape time:
@@ -517,6 +526,61 @@ from quietly serving traffic the pool refused for other reasons:
 
 Each of the three is counted (see Metrics) so an alert can tell a quota
 outage from a client sending a dead model id.
+
+### Pool-only clients
+
+A client that runs its own fallback chain and spend accounting (an AI
+gateway in front of several providers) should never be billed on this
+proxy's `[[fallback]]` or see its model silently swapped. Mark its key:
+
+```toml
+[[client_auth.keys]]
+key = "sha256:..."
+name = "ai-gateway"
+pool_only = true
+```
+
+For that key the proxy uses the ChatGPT pool and nothing else:
+
+- no `[[fallback]]` provider and no `[models.downgrades]` retry; the pool's
+  final response (any status) is relayed as is, so the caller can fall back
+  on its own;
+- when every pool account is quota-held or cooling down, it answers at once
+  with `503 {"error":{"type":"server_error","code":"pool_unavailable",...}}`
+  and makes no upstream call — with or without a fallback chain configured;
+- `/v1/embeddings` (served only by a paid provider) is refused with `403`
+  `code: pool_only`. `/v1/responses/compact` and `/v1/alpha/search` already
+  go to the pool only, for every client.
+
+The other guardrails (unknown-model 400, pool 4xx relay) apply unchanged.
+
+### Stream lookahead
+
+Codex answers `200` and only then reports, as an `error` or
+`response.failed` event, that it is overloaded — or ends the stream with no
+output. Relayed as is, that looks like a successful answer. So on both
+`/v1/chat/completions` and `/v1/responses` the pool's stream is held back
+until its first event that carries output (a text, reasoning or tool-call
+delta, a tool-call item, or `response.completed` with output); metadata like
+`response.created` doesn't count. If an error or the end of the stream comes
+first, it becomes a failed pool response:
+
+| Upstream | Status | `error.code` | failover `reason` |
+|---|---|---|---|
+| overloaded / rate / capacity error | 503 | `upstream_overloaded` | `capacity` |
+| any other error event | 502 | `upstream_error` | `upstream_5xx` |
+| stream ended without output | 502 | `empty_response` | `empty_response` |
+| no output within `request_timeout_secs` | 504 | `upstream_timeout` | `timeout` |
+
+The classification uses the error's `code`/`type` when present, its message
+otherwise. A normal client then goes on to `[[fallback]]` as for any pool
+5xx; a `pool_only` client gets the status. Once output has started the
+status can't change any more: a later error stays an in-band `[error]`
+chunk on chat streams. The held-back bytes are capped at
+`server.max_body_bytes` (past that the stream is relayed unchecked), and a
+committed stream is replayed byte for byte. A buffered (non-stream) chat
+completion with no content, tool call or reasoning is a 502
+`empty_response` too, from a fallback provider as well.
 
 ## Fallback providers
 
