@@ -80,17 +80,20 @@ pub async fn check_first_output(
     max_bytes: usize,
     timeout: Duration,
 ) -> Checked {
-    let is_sse = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream"));
-    if !response.status().is_success() || !is_sse {
+    if !response.status().is_success() {
         return Checked {
             response,
             reason: None,
         };
     }
+    // The Codex backend labels its SSE `application/json`, so the header
+    // alone can't tell; anything else is sniffed from the first bytes.
+    let mut is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+        .then_some(true);
 
     let status = response.status();
     let version = response.version();
@@ -109,6 +112,7 @@ pub async fn check_first_output(
                     format!("no output from upstream within {}s", timeout.as_secs()),
                 )
             }
+            Ok(None) if is_sse != Some(true) => break Event::Metadata,
             Ok(None) => break end_of_stream(&scan),
             // The client's own read_timeout can fire before the deadline above.
             Ok(Some(Err(e))) if e.is_timeout() => {
@@ -122,6 +126,15 @@ pub async fn check_first_output(
         held_bytes += chunk.len();
         scan.extend_from_slice(&chunk);
         held.push(chunk);
+        if is_sse.is_none() {
+            is_sse = looks_like_sse(&scan);
+            if is_sse == Some(false) {
+                break Event::Metadata;
+            }
+        }
+        if is_sse != Some(true) {
+            continue;
+        }
 
         let mut decided = None;
         while let Some((pos, dlen)) = find_event_delimiter(&scan) {
@@ -182,6 +195,20 @@ pub async fn check_first_output(
                 reason: Some(reason),
             }
         }
+    }
+}
+
+/// `None` while the bytes so far could still open an SSE field.
+fn looks_like_sse(head: &[u8]) -> Option<bool> {
+    const FIELDS: [&[u8]; 5] = [b"event:", b"data:", b"id:", b"retry:", b":"];
+    let start = head.iter().position(|b| !b.is_ascii_whitespace())?;
+    let head = &head[start..];
+    if FIELDS.iter().any(|f| head.starts_with(f)) {
+        Some(true)
+    } else if FIELDS.iter().any(|f| f.starts_with(head)) {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -467,6 +494,68 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
+    }
+
+    fn with_content_type(body: &'static str, ct: &'static str) -> reqwest::Response {
+        let mut r = axum::http::Response::new(Bytes::from_static(body.as_bytes()));
+        r.headers_mut().insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static(ct),
+        );
+        reqwest::Response::from(r)
+    }
+
+    #[tokio::test]
+    async fn sse_labelled_as_json_is_still_checked() {
+        // The Codex backend sends its SSE as `application/json`.
+        let r = with_content_type(
+            concat!(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded.\"}}\n\n",
+            ),
+            "application/json",
+        );
+        let checked = check_first_output(r, "acct", 1024 * 1024, Duration::from_secs(5)).await;
+        assert_eq!(checked.response.status().as_u16(), 503);
+        assert_eq!(checked.reason, Some(FailureReason::Capacity));
+    }
+
+    #[tokio::test]
+    async fn a_field_name_split_across_chunks_is_still_sse() {
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"da")),
+            Ok(Bytes::from_static(
+                b"ta: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded.\"}\n\n",
+            )),
+        ]);
+        let mut r = axum::http::Response::new(reqwest::Body::wrap_stream(chunks));
+        r.headers_mut().insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let checked = check_first_output(
+            reqwest::Response::from(r),
+            "acct",
+            1024,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(checked.response.status().as_u16(), 503);
+    }
+
+    #[tokio::test]
+    async fn real_json_is_untouched() {
+        const BODY: &str = "{\"id\":\"resp_1\",\"output\":[]}";
+        let checked = check_first_output(
+            with_content_type(BODY, "application/json"),
+            "acct",
+            1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(checked.reason, None);
+        assert_eq!(checked.response.status().as_u16(), 200);
+        assert_eq!(checked.response.text().await.unwrap(), BODY);
     }
 
     #[tokio::test]

@@ -501,17 +501,21 @@ async fn health() -> impl IntoResponse {
 /// Models this proxy advertises AND accepts (see `[models] reject_unknown`),
 /// most capable first (the order is client-visible — pickers render it as
 /// given). Exactly the `visibility: list` entries of the live Codex catalog
-/// (`/backend-api/codex/models`), by family: gpt-6.1 sol/terra, the gpt-6
+/// (`/backend-api/codex/models`), by family: gpt-6.2 sol/astra, gpt-6.1
+/// sol/terra, the gpt-6
 /// astra/sol/luna trio and the 5.6 sol/terra/luna trio. Older generations the
 /// catalog no longer lists (gpt-5.5, gpt-5.4, the *-codex models) are refused;
 /// so are hidden catalog entries (`gpt-reserve`, `codex-auto-review`), which
-/// aren't advertised. The bare "gpt-6.1"/"gpt-6"/"gpt-5.6" names are listed for
+/// aren't advertised. The bare "gpt-6.2"/"gpt-6.1"/"gpt-6"/"gpt-5.6" names are listed for
 /// OpenAI-style clients and resolved to their flavored form by the default
 /// model aliases — on both POST endpoints, so a client that picks a bare name
 /// out of this very list reaches the subscription pool whichever wire API it
 /// speaks. Both the list and retrieve endpoints derive their output from this
 /// slice.
 const SUPPORTED_MODELS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "gpt-6.2",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
     "gpt-6.1",
@@ -1292,12 +1296,12 @@ mod tests {
         )
         .unwrap();
         let listed = &list["data"][0];
-        assert_eq!(listed["id"], "gpt-6.1-sol");
+        assert_eq!(listed["id"], "gpt-6.2-sol");
 
         let retrieved = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/v1/models/gpt-6.1-sol")
+                    .uri("/v1/models/gpt-6.2-sol")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3081,11 +3085,20 @@ mod tests {
             ("gpt-6-luna", StatusCode::OK, "{}"),
             ("gpt-6.1-sol", StatusCode::OK, "{}"),
             ("gpt-6.1-terra", StatusCode::OK, "{}"),
+            ("gpt-6.2-sol", StatusCode::OK, "{}"),
+            ("gpt-6.2-astra", StatusCode::OK, "{}"),
         ])
         .await;
         let fallback = start_model_aware_upstream(vec![]).await;
         let (app, _) = guarded_router(guarded_config(&pool.base_url, &fallback.base_url, 30));
-        for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+        ] {
             let body = format!(r#"{{"model":"{model}","input":"hi"}}"#);
             let response = app
                 .clone()
@@ -3104,7 +3117,14 @@ mod tests {
         }
         assert_eq!(
             pool.seen(),
-            ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"]
+            [
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra"
+            ]
         );
         let listed = app
             .oneshot(
@@ -3193,7 +3213,7 @@ mod tests {
 
     // ---- conversation affinity: prompt_cache_key, sticky fallback, cache metrics ----
 
-    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}}}}\n\n";
+    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}}}}\n\n";
 
     fn chat_request(messages: serde_json::Value, extra: serde_json::Value) -> HttpRequest<Body> {
         let mut body = json!({"model": "gpt-6-astra", "messages": messages, "stream": true});
