@@ -3193,7 +3193,7 @@ mod tests {
 
     // ---- conversation affinity: prompt_cache_key, sticky fallback, cache metrics ----
 
-    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}}}}\n\n";
+    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1000,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":800,\"cache_write_tokens\":150}}}}\n\n";
 
     fn chat_request(messages: serde_json::Value, extra: serde_json::Value) -> HttpRequest<Body> {
         let mut body = json!({"model": "gpt-6-astra", "messages": messages, "stream": true});
