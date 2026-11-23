@@ -83,8 +83,8 @@ originator = "codex_cli_rs"
 # CODEXPROXY_CLI_VERSION. Keep it >= the highest `minimal_client_version` of
 # the models below (gpt-6-sol/gpt-6-luna want 0.155.0) — and note the upstream
 # serves gpt-6.1-sol only to 0.160+ despite its catalog entry saying 0.153.0;
-# gpt-6.1-terra is in the bundled catalog from 0.166.0.
-cli_version = "0.166.0"
+# gpt-6.1-terra and gpt-6.2-sol/astra are in the bundled catalog from 0.166.0.
+cli_version = "0.171.0"
 # Refresh the access token this many seconds before its JWT `exp`.
 refresh_skew_secs = 300
 request_timeout_secs = 600
@@ -134,10 +134,11 @@ include_reasoning = false
 # Map client model names onto upstream model ids. Applied on BOTH POST
 # endpoints — /v1/chat/completions and the /v1/responses passthrough Codex
 # itself uses. NOTE: defining this section replaces the built-in alias map —
-# keep the "gpt-6.1", "gpt-6" and "gpt-5.6" entries, the upstream only accepts
-# the flavored slugs (gpt-6.1-sol; gpt-6-astra; gpt-5.6-sol/terra/luna) and 400s
-# the bare names onto the paid fallback.
+# keep the "gpt-6.2", "gpt-6.1", "gpt-6" and "gpt-5.6" entries, the upstream only
+# accepts the flavored slugs (gpt-6.2-sol; gpt-6.1-sol; gpt-6-astra;
+# gpt-5.6-sol/terra/luna) and 400s the bare names onto the paid fallback.
 [defaults.model_aliases]
+"gpt-6.2" = "gpt-6.2-sol"
 "gpt-6.1" = "gpt-6.1-sol"
 "gpt-6" = "gpt-6-astra"
 "gpt-5.6" = "gpt-5.6-sol"
